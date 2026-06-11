@@ -6,8 +6,11 @@ Class used for the parsing of .kv files into rules.
 '''
 import os
 
+import io
 import re
 import sys
+import keyword
+import tokenize
 import traceback
 import ast
 import importlib
@@ -23,7 +26,7 @@ from kivy.resources import resource_find
 from kivy.utils import rgba
 import kivy.metrics as Metrics
 
-__all__ = ('Parser', 'ParserException')
+__all__ = ('Parser', 'ParserException', 'ParserControlRule')
 
 
 trace = Logger.trace
@@ -47,6 +50,18 @@ lang_key = re.compile('([a-zA-Z_]+)')
 lang_keyvalue = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]+)')
 lang_tr = re.compile(r'(_\()')
 lang_cls_split_pat = re.compile(', *')
+
+# control statement keywords introducing a block at child-widget position
+lang_control_kw = re.compile(r'(if|elif|else|for|slot)(?![A-Za-z0-9_])')
+# reserved for future control statements; using them is a parse error
+lang_reserved_kw = re.compile(r'(while|match|case)(?![A-Za-z0-9_])')
+
+# names that a loop target may not shadow: load-bearing binding names and
+# the metric helpers injected in global_idmap (which take precedence over
+# rule-local names in handler idmaps)
+_control_forbidden_targets = {
+    'self', 'root', 'app', 'args',
+    'pt', 'inch', 'cm', 'mm', 'dp', 'sp', 'rgba'}
 
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
@@ -301,7 +316,8 @@ class ParserRule(object):
 
     __slots__ = ('ctx', 'line', 'name', 'children', 'id', 'properties',
                  'canvas_before', 'canvas_root', 'canvas_after',
-                 'handlers', 'level', 'cache_marked', 'avoid_previous_rules')
+                 'handlers', 'level', 'cache_marked', 'avoid_previous_rules',
+                 'has_controls')
 
     def __init__(self, ctx, line, name, level):
         super(ParserRule, self).__init__()
@@ -331,6 +347,8 @@ class ParserRule(object):
         self.cache_marked = []
         #: Indicate if any previous rules should be avoided.
         self.avoid_previous_rules = False
+        #: True if any child is a control statement (if/for/slot)
+        self.has_controls = False
 
         if level == 0:
             self._detect_selectors()
@@ -338,6 +356,8 @@ class ParserRule(object):
             self._forbid_selectors()
 
     def precompile(self):
+        self.has_controls = any(
+            isinstance(x, ParserControlRule) for x in self.children)
         for x in self.properties.values():
             x.precompile()
         for x in self.handlers:
@@ -434,6 +454,202 @@ class ParserRule(object):
 
     def __repr__(self):
         return '<ParserRule name=%r>' % (self.name, )
+
+
+class ParserControlBranch(object):
+    '''One branch of an ``if``/``elif``/``else`` chain.
+
+    .. versionadded:: 3.1.0
+    '''
+
+    __slots__ = ('cond_src', 'line', 'children')
+
+    def __init__(self, cond_src, line, children):
+        #: Condition source, or None for the ``else`` branch
+        self.cond_src = cond_src
+        #: Line of the branch header
+        self.line = line
+        #: Child rules of the branch
+        self.children = children
+
+
+class ParserControlRule(ParserRule):
+    '''A control statement (``if``/``for``/``slot``) at child-widget
+    position. ``elif``/``else`` rules only exist transiently during
+    parsing; they are merged into the preceding ``if`` rule as
+    :class:`ParserControlBranch` entries.
+
+    .. versionadded:: 3.1.0
+    '''
+
+    __slots__ = ('kind', 'cond_src', 'branches', 'target_names',
+                 'iterator_prop', 'selector_prop', 'key_prop',
+                 'slot_name', 'closed')
+
+    def __init__(self, ctx, line, name, level):
+        super(ParserControlRule, self).__init__(ctx, line, name, level)
+        #: One of 'if', 'elif', 'else', 'for', 'slot'
+        self.kind = name
+        #: Condition source for if/elif
+        self.cond_src = None
+        #: List of ParserControlBranch for a merged if-chain, else None
+        self.branches = None
+        #: Loop target names, in tuple order, for 'for'
+        self.target_names = None
+        #: ParserRuleProperty evaluating to the list of loop value tuples
+        self.iterator_prop = None
+        #: ParserRuleProperty evaluating to the active branch index
+        self.selector_prop = None
+        #: ParserRuleProperty of the reserved 'key:' directive (unused yet)
+        self.key_prop = None
+        #: Slot name ('' is the default slot)
+        self.slot_name = ''
+        #: True once an 'else' branch has been merged
+        self.closed = False
+
+    def absorb_branch(self, rule):
+        # merge a trailing elif/else rule into this if-chain
+        if self.branches is None:
+            self.branches = [
+                ParserControlBranch(self.cond_src, self.line, self.children)]
+            self.children = []
+        self.branches.append(
+            ParserControlBranch(rule.cond_src, rule.line, rule.children))
+        if rule.kind == 'else':
+            self.closed = True
+
+    def _reject_property(self, prop):
+        if prop.name == 'key':
+            raise ParserException(
+                self.ctx, prop.line,
+                '"key:" is only allowed inside a "for" block')
+        raise ParserException(
+            self.ctx, prop.line,
+            '%r is a property and cannot be made conditional with control '
+            'statement blocks. Use a conditional expression on the widget '
+            'instead, e.g. `%s: value_a if condition else value_b`' % (
+                prop.name, prop.name))
+
+    def _forbid_slot_definitions(self, rules):
+        # a slot declared inside a "for" block would create several
+        # simultaneous insertion points for the same slot name; walk the
+        # same-widget child positions (descending through control blocks,
+        # but not into child widgets, which own their slots) and reject
+        for rule in rules:
+            if not isinstance(rule, ParserControlRule):
+                continue
+            if rule.kind == 'slot':
+                raise ParserException(
+                    self.ctx, rule.line,
+                    'a slot cannot be declared inside a "for" block')
+            if rule.branches is not None:
+                for branch in rule.branches:
+                    self._forbid_slot_definitions(branch.children)
+            else:
+                self._forbid_slot_definitions(rule.children)
+
+    def _forbid_ids(self, rules):
+        # ids inside control blocks would appear in and vanish from
+        # root.ids as branches are built and destroyed, silently breaking
+        # any expression bound to them; reject them at parse time
+        for rule in rules:
+            if isinstance(rule, ParserControlRule):
+                # nested control rules validate their own subtree
+                continue
+            if rule.id:
+                raise ParserException(
+                    self.ctx, rule.line,
+                    '"id" is not allowed on widgets inside a control '
+                    'statement block, as the widget may not exist when '
+                    'the id is accessed')
+            self._forbid_ids(rule.children)
+
+    def precompile(self):
+        ctx, line, kind = self.ctx, self.line, self.kind
+        if kind in ('elif', 'else'):
+            # merge should have absorbed these; reaching here means orphan
+            raise ParserException(
+                ctx, line,
+                '"%s" must immediately follow an "if" or "elif" block' % kind)
+        if self.id:
+            raise ParserException(
+                ctx, line, '"id" is not allowed directly inside a control '
+                'statement block; declare it on a widget')
+        if self.handlers:
+            raise ParserException(
+                ctx, self.handlers[0].line,
+                'event handlers are not allowed directly inside a control '
+                'statement block; declare them on a widget')
+        if self.canvas_before or self.canvas_root or self.canvas_after:
+            raise ParserException(
+                ctx, line, 'canvas is not allowed directly inside a control '
+                'statement block; declare it on a widget')
+
+        if kind == 'if':
+            if self.properties:
+                self._reject_property(next(iter(self.properties.values())))
+            if self.branches is None:
+                self.branches = [
+                    ParserControlBranch(self.cond_src, line, self.children)]
+                self.children = []
+            parts = []
+            for index, branch in enumerate(self.branches):
+                if not branch.children:
+                    raise ParserException(
+                        ctx, branch.line, 'control statement block requires '
+                        'at least one child widget')
+                if branch.cond_src is not None:
+                    parts.append('%d if (%s) else' % (index, branch.cond_src))
+                else:
+                    parts.append(str(index))
+            if self.branches[-1].cond_src is not None:
+                parts.append('-1')
+            self.selector_prop = ParserRuleProperty(
+                ctx, line, 'kv_if', ' '.join(parts))
+            self.selector_prop.precompile()
+            for branch in self.branches:
+                self._forbid_ids(branch.children)
+                for child in branch.children:
+                    child.precompile()
+        elif kind == 'for':
+            self.key_prop = self.properties.pop('key', None)
+            if self.properties:
+                self._reject_property(next(iter(self.properties.values())))
+            if not self.children:
+                raise ParserException(
+                    ctx, line, 'control statement block requires at least '
+                    'one child widget')
+            if self.key_prop is not None and \
+                    self.key_prop.line > min(c.line for c in self.children):
+                raise ParserException(
+                    ctx, self.key_prop.line,
+                    '"key:" must be declared before any widget of the '
+                    '"for" block')
+            self.iterator_prop.precompile()
+            if self.key_prop is not None:
+                self.key_prop.precompile()
+            # drop watched keys rooted at a loop target: they are loop-local
+            # values, and the builder idmap may hold an unrelated widget id
+            # under the same name, which would be bound by mistake
+            targets = set(self.target_names)
+            for prop in (self.iterator_prop, self.key_prop):
+                if prop is not None and prop.watched_keys is not None:
+                    prop.watched_keys = [
+                        k for k in prop.watched_keys if k[0] not in targets
+                    ] or None
+            self._forbid_ids(self.children)
+            for child in self.children:
+                child.precompile()
+            self._forbid_slot_definitions(self.children)
+        else:  # slot; an empty block is valid (no fallback content)
+            if self.properties:
+                self._reject_property(next(iter(self.properties.values())))
+            self._forbid_ids(self.children)
+            for child in self.children:
+                child.precompile()
+
+    def __repr__(self):
+        return '<ParserControlRule kind=%r line=%d>' % (self.kind, self.line)
 
 
 class Parser(object):
@@ -598,6 +814,172 @@ class Parser(object):
             if not stripped:
                 lines.remove((ln, line))
 
+    def _extract_control_header(self, ln, content):
+        '''Return the text of a control statement line up to its final
+        top-level colon, validating that nothing but an optional comment
+        follows the colon. Uses the Python tokenizer so colons inside
+        strings, dicts, slices or lambdas are handled correctly.
+        '''
+        try:
+            tokens = list(
+                tokenize.generate_tokens(io.StringIO(content).readline))
+        except (tokenize.TokenError, IndentationError, SyntaxError) as e:
+            raise ParserException(
+                self, ln, 'Invalid control statement: %s' % (e,))
+        depth = 0
+        colon = None
+        for tok in tokens:
+            if tok.type == tokenize.OP:
+                if tok.string in '([{':
+                    depth += 1
+                elif tok.string in ')]}':
+                    depth -= 1
+                elif tok.string == ':' and depth == 0:
+                    colon = tok
+        if colon is None:
+            raise ParserException(
+                self, ln,
+                "expected ':' at the end of the control statement")
+        after = content[colon.end[1]:].strip()
+        if after and not after.startswith('#'):
+            raise ParserException(
+                self, ln, "unexpected content after ':'; the body of a "
+                'control statement must be on the following indented lines')
+        return content[:colon.start[1]]
+
+    def _validate_expression(self, ln, src, what):
+        try:
+            tree = ast.parse(src, mode='eval')
+        except SyntaxError as e:
+            raise ParserException(
+                self, ln, 'Invalid %s expression: %s' % (what, e.msg))
+        self._forbid_walrus(ln, tree)
+        return tree
+
+    def _forbid_walrus(self, ln, tree):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.NamedExpr):
+                raise ParserException(
+                    self, ln, 'assignment expressions (":=") are not '
+                    'allowed in control statement headers')
+
+    def _collect_target_names(self, ln, node):
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Starred):
+            return self._collect_target_names(ln, node.value)
+        if isinstance(node, (ast.Tuple, ast.List)):
+            names = []
+            for elt in node.elts:
+                names.extend(self._collect_target_names(ln, elt))
+            return names
+        raise ParserException(self, ln, 'unsupported loop target')
+
+    def _parse_for_header(self, ln, rest):
+        '''Parse the part of a ``for`` header after the keyword, using
+        Python's comprehension grammar (so trailing ``if`` filters are
+        supported). Returns (target_src, target_names, iter_src, if_srcs).
+        '''
+        src = '(None for %s)' % rest
+        try:
+            tree = ast.parse(src, mode='eval')
+        except SyntaxError as e:
+            raise ParserException(
+                self, ln, 'Invalid "for" statement: %s' % (e.msg,))
+        gen = tree.body
+        if not isinstance(gen, ast.GeneratorExp) or len(gen.generators) != 1:
+            raise ParserException(
+                self, ln,
+                'only a single "for ... in ..." clause is allowed')
+        self._forbid_walrus(ln, tree)
+        comp = gen.generators[0]
+        if comp.is_async:
+            raise ParserException(
+                self, ln, '"async for" is not supported in kv')
+        names = self._collect_target_names(ln, comp.target)
+        forbidden = [n for n in names if n in _control_forbidden_targets]
+        if forbidden:
+            raise ParserException(
+                self, ln, 'loop target cannot shadow the reserved name(s) '
+                '%s' % ', '.join(map(repr, forbidden)))
+        target_src = ast.get_source_segment(src, comp.target)
+        iter_src = ast.get_source_segment(src, comp.iter)
+        if_srcs = [ast.get_source_segment(src, c) for c in comp.ifs]
+        return target_src, names, iter_src, if_srcs
+
+    def parse_control_rule(self, ln, content, rlevel, kw):
+        '''Build a :class:`ParserControlRule` from a control statement line.
+        '''
+        header = self._extract_control_header(ln, content)
+        rest = header[len(kw):].strip()
+        rule = ParserControlRule(self, ln, kw, rlevel)
+        if kw == 'else':
+            if rest:
+                raise ParserException(
+                    self, ln, '"else" takes no expression')
+        elif kw in ('if', 'elif'):
+            if not rest:
+                raise ParserException(
+                    self, ln, '"%s" requires a condition expression' % kw)
+            self._validate_expression(ln, rest, kw)
+            rule.cond_src = rest
+        elif kw == 'for':
+            target_src, names, iter_src, if_srcs = \
+                self._parse_for_header(ln, rest)
+            rule.target_names = names
+            # one expression evaluating to the list of loop value tuples;
+            # this funnels reactivity through the standard watched-keys
+            # machinery (the iterable and any dotted names in filters)
+            value = '[(%s,) for %s in (%s)%s]' % (
+                ', '.join(names), target_src, iter_src,
+                ''.join(' if (%s)' % s for s in if_srcs))
+            rule.iterator_prop = ParserRuleProperty(self, ln, 'kv_for', value)
+        else:  # slot
+            if rest:
+                if not rest.isidentifier() or keyword.iskeyword(rest):
+                    raise ParserException(
+                        self, ln, 'invalid slot name %r; a slot name must '
+                        'be a plain identifier' % rest)
+            rule.slot_name = rest
+        return rule
+
+    def _merge_control_chains(self, objects):
+        '''Merge trailing elif/else rules into their preceding if rule and
+        validate chain adjacency.
+        '''
+        merged = []
+        for obj in objects:
+            if isinstance(obj, ParserControlRule) and \
+                    obj.kind in ('elif', 'else'):
+                prev = merged[-1] if merged else None
+                if isinstance(prev, ParserControlRule) and \
+                        prev.kind == 'for' and obj.kind == 'else':
+                    raise ParserException(
+                        self, obj.line, '"else" after "for" is not '
+                        'supported; use a separate "if not <iterable>:" '
+                        'block for the empty case')
+                if not isinstance(prev, ParserControlRule) or \
+                        prev.kind != 'if' or prev.closed:
+                    raise ParserException(
+                        self, obj.line, '"%s" must immediately follow an '
+                        '"if" or "elif" block' % obj.kind)
+                prev.absorb_branch(obj)
+                continue
+            merged.append(obj)
+        return merged
+
+    def _forbid_controls_in_canvas(self, objects):
+        '''Reject control statements anywhere under a canvas block,
+        including nested under graphics instructions (whose child rules
+        would otherwise be silently ignored by the builder).
+        '''
+        for obj in objects:
+            if isinstance(obj, ParserControlRule):
+                raise ParserException(
+                    self, obj.line,
+                    'control statements are not allowed inside canvas')
+            self._forbid_controls_in_canvas(obj.children)
+
     def parse_level(self, level, lines, spaces=0):
         '''Parse the current level (level * spaces) indentation.
         '''
@@ -639,6 +1021,23 @@ class Parser(object):
 
             # Current level, create an object
             elif count == indent:
+                rkw = lang_reserved_kw.match(content)
+                if rkw is not None:
+                    raise ParserException(
+                        self, ln, '"%s" is reserved for future kv control '
+                        'statements' % rkw.group(1))
+                ctl = lang_control_kw.match(content)
+                if ctl is not None:
+                    if count == 0:
+                        raise ParserException(
+                            self, ln, 'control statements are not allowed '
+                            'at the top level of a kv file')
+                    current_object = self.parse_control_rule(
+                        ln, content, rlevel, ctl.group(1))
+                    current_property = None
+                    objects.append(current_object)
+                    i += 1
+                    continue
                 x = content.split(':', 1)
                 if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
@@ -659,6 +1058,12 @@ class Parser(object):
 
             # Next level, is it a property or an object ?
             elif count == indent + spaces:
+                rkw = lang_reserved_kw.match(content)
+                if rkw is not None:
+                    raise ParserException(
+                        self, ln, '"%s" is reserved for future kv control '
+                        'statements' % rkw.group(1))
+                is_control = lang_control_kw.match(content) is not None
                 x = content.split(':', 1)
                 if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
@@ -670,7 +1075,7 @@ class Parser(object):
                 if ignore_prev:
                     name = name[1:]
 
-                if ord(name[0]) in Parser.CLASS_RANGE:
+                if is_control or ord(name[0]) in Parser.CLASS_RANGE:
                     if ignore_prev:
                         raise ParserException(
                             self, ln, 'clear previous, `-`, not allowed here')
@@ -678,7 +1083,8 @@ class Parser(object):
                         level + 1, lines[i:], spaces)
                     if current_object is None:
                         raise ParserException(self, ln, 'Invalid indentation')
-                    current_object.children = _objects
+                    current_object.children = self._merge_control_chains(
+                        _objects)
                     lines = _lines
                     i = 0
 
@@ -721,6 +1127,7 @@ class Parser(object):
                         'canvas', 'canvas.after', 'canvas.before'):
                     _objects, _lines = self.parse_level(
                         level + 2, lines[i:], spaces)
+                    self._forbid_controls_in_canvas(_objects)
                     rl = ParserRule(self, ln, current_property, rlevel)
                     rl.children = _objects
                     if current_property == 'canvas':
