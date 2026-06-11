@@ -474,6 +474,115 @@ In Python, you can create an instance of the dynamic class as follows:
     properties/methods override those of the child. Be careful if you choose
     to do this.
 
+.. _kv_control_statements:
+
+Control statements
+------------------
+
+.. versionadded:: 3.1.0
+
+At any child-widget position, kv accepts ``if``/``elif``/``else``, ``for``
+and ``slot`` blocks. They control which child widgets exist, and they are
+reactive: when a property used in the condition or the iterable changes,
+the affected children are destroyed and rebuilt automatically.
+
+Conditional children::
+
+    <StatusPanel@BoxLayout>:
+        connected: False
+        Label:
+            text: 'Status'
+        if self.connected:
+            Label:
+                text: 'online'
+        else:
+            Label:
+                text: 'offline'
+
+Toggling ``connected`` swaps the ``online``/``offline`` label in place,
+keeping the position between sibling widgets.
+
+Repeated children::
+
+    <TodoList@BoxLayout>:
+        items: []
+        for item in self.items:
+            key: item.uid
+            Label:
+                text: item.title
+
+The ``for`` header uses Python's comprehension grammar, so tuple targets
+and trailing ``if`` filters work: ``for item, index in
+enumerate(self.items) if item.visible:``. The loop variables are
+available in the property and handler expressions of the block's
+children. If the items themselves are
+:class:`~kivy.event.EventDispatcher` instances (e.g. widgets or
+view-models), expressions such as ``item.title`` rebind per iteration as
+usual.
+
+The optional ``key:`` directive must be the first entry of the block and
+gives each iteration a stable identity: when the iterable changes, an
+iteration whose key is still present and whose loop values are unchanged
+keeps its widgets (moving them if the order changed); everything else is
+destroyed and rebuilt. Without ``key:`` the position in the iterable is
+the key. Keys must be hashable and unique.
+
+Slots make a class rule's widget tree customizable at the usage site::
+
+    <Card@BoxLayout>:
+        orientation: 'vertical'
+        slot header:
+            Label:          # fallback, shown when nobody fills the slot
+                text: 'untitled'
+        slot:               # default slot: plain children land here
+        Label:
+            text: 'footer'
+
+    # usage:
+    Card:
+        slot header:
+            Image:
+                source: root.logo
+        Label:              # plain child, routed into the default slot
+            text: 'body'
+
+The first rule declaring ``slot name:`` defines the insertion point and
+its fallback content. Any later rule declaring the same name provides
+content for it instead: a subclass rule overrides the base fallback, and
+the widget instance overrides both — the most derived provider wins.
+Fill content is evaluated in the context of the rule providing it, so in
+the example above ``root.logo`` refers to the rule instantiating the
+``Card``, not to the ``Card`` itself. A slot may be defined inside an
+``if`` block (the insertion point then comes and goes with the branch),
+and a fill may define new slots of its own under a fresh name, which
+re-exposes customization through a wrapper class.
+
+Restrictions:
+
+- Control statements cannot appear at the top level of a kv file, inside
+  ``canvas`` blocks, or carry properties, ``id``, event handlers or
+  ``canvas`` themselves — declare those on a widget. To make a
+  *property* conditional, use a conditional expression instead:
+  ``text: 'a' if condition else 'b'``.
+- ``id`` is not allowed on any widget inside a control block or routed
+  into a slot, since the widget may not exist when the id is accessed.
+- Loop targets cannot shadow the reserved names (``self``, ``root``,
+  ``app``, ``args`` and the metric helpers), and assignment expressions
+  (``:=``) are not allowed in headers.
+- A slot cannot be defined inside a ``for`` block, slot fills must be
+  direct children of the widget instance (put an ``if`` *inside* the
+  fill to make its content conditional), and a ``slot:`` fill block
+  cannot be mixed with plain children.
+- ``while``, ``match`` and ``case`` are reserved for possible future
+  use.
+
+.. warning::
+
+    The children built by control statements are managed: manually
+    removing or reordering the children of a widget that uses control
+    statements (or inserting at arbitrary positions) will confuse the
+    position tracking. Appending children is fine.
+
 .. _redefining-style:
 
 Redefining a widget's style
