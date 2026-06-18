@@ -113,8 +113,11 @@ Card:
 - No properties, `id`, event handlers, or `canvas` directly on a control
   block — for a conditional *property*, use a conditional expression
   (`text: 'a' if cond else 'b'`).
-- Loop targets can't shadow `self`/`root`/`app`/`args` or the metric
-  helpers; no walrus in headers; no `async for`; single `for` clause.
+- Loop targets form their own scope and may shadow any name (including
+  `self`/`root`/`app` and the metric helpers): the loop variable wins over
+  the global kv context, while a child widget's own `self`/`args` still win
+  inside that widget. No walrus in headers; no `async for`; single `for`
+  clause.
 - No slot definitions inside `for`; fills must be direct children of the
   instance (put the `if` *inside* the fill); a `slot:` fill block can't be
   mixed with plain children; keys must be hashable and unique.

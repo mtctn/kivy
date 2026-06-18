@@ -248,13 +248,27 @@ if True:
         Label:
 ''', 'assignment expressions')
 
-    def test_loop_target_cannot_shadow_reserved(self):
-        for name in ('self', 'root', 'app', 'dp'):
-            self.assert_parse_error('''
+    def test_loop_target_may_shadow_reserved_names(self):
+        # loop targets form their own scope and may shadow any name,
+        # including self/root/app and the metric helpers (resolved at
+        # runtime; here we only assert the parser accepts them)
+        for name in ('self', 'root', 'app', 'dp', 'cm', 'rgba'):
+            ctl = parse_rule('''
 <W@Widget>:
     for %s in self.items:
         Label:
-''' % name, 'cannot shadow the reserved name')
+''' % name).children[0]
+            self.assertEqual(ctl.target_names, [name])
+
+    def test_key_must_precede_widgets(self):
+        # "key:" is a property; like all kv properties it must come before
+        # the block's child widgets (kv rejects any property after a child)
+        self.assert_parse_error('''
+<W@Widget>:
+    for item in self.items:
+        Label:
+        key: item.uid
+''', 'Invalid data after declaration')
 
     def test_property_inside_if_forbidden(self):
         self.assert_parse_error('''

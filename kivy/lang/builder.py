@@ -168,9 +168,28 @@ def update_intermediates(base, keys, bound, s, fn, args, instance, value):
     fn(args, None, None)
 
 
+#: Reserved key under which a control statement's loop variables travel
+#: inside an ``ids`` map. Loop variables form their own scope: they win
+#: over the global kv context (metric helpers, ``app``, ``#:import`` names)
+#: but never over a widget's own ``self``/``args``, which are injected
+#: last. Hidden behind a dunder so it can never collide with a kv id, and
+#: absent entirely outside ``for`` blocks, leaving legacy rules untouched.
+_LOOP_KEY = '__kvlang_loop__'
+
+
+def _merge_loop_scope(idmap):
+    '''Fold the loop scope (if any) on top of ``idmap`` in place, so loop
+    variables shadow the global context. Returns ``idmap``.'''
+    loop = idmap.pop(_LOOP_KEY, None)
+    if loop:
+        idmap.update(loop)
+    return idmap
+
+
 def create_handler(iself, element, key, value, rule, idmap, delayed=False):
     idmap = copy(idmap)
     idmap.update(global_idmap)
+    _merge_loop_scope(idmap)
     idmap['self'] = iself.proxy_ref
     bound_list = _handlers[iself.uid][key]
     handler_append = bound_list.append
@@ -676,20 +695,17 @@ class ForNode(ExpressionNode):
         return tuple(group[2] for group in self.groups)
 
     def activate(self, created):
-        crule = self.crule
-        for name in crule.target_names:
-            if name in global_idmap:
-                raise BuilderException(
-                    crule.ctx, crule.line,
-                    'loop target %r collides with a name in the global kv '
-                    'context' % name)
-        self._bind_expression(crule.iterator_prop, created)
+        self._bind_expression(self.crule.iterator_prop, created)
 
     def _eval_key(self, key_prop, names, values):
         idmap = copy(self.ids)
         idmap.update(global_idmap)
+        # loop variables (this iteration's, layered over any enclosing
+        # loops) shadow the global context, then self is fixed last
+        loop = dict(idmap.pop(_LOOP_KEY, None) or ())
+        loop.update(zip(names, values))
+        idmap.update(loop)
         idmap['self'] = self.parent
-        idmap.update(zip(names, values))
         try:
             return eval(key_prop.co_value, idmap)
         except Exception as e:
@@ -795,7 +811,11 @@ class ForNode(ExpressionNode):
             else:
                 key, values = fresh
                 idmap = dict(self.ids)
-                idmap.update(zip(names, values))
+                # publish this iteration's targets into the loop scope,
+                # nested on top of any enclosing loop's variables
+                loop = dict(idmap.get(_LOOP_KEY) or ())
+                loop.update(zip(names, values))
+                idmap[_LOOP_KEY] = loop
                 items = []
                 self.groups.append([key, values, items])
                 pos = self._build_content(
@@ -1237,6 +1257,7 @@ class BuilderBase(object):
             # code simply access root_widget.id_name
             _ids = dict(rctx['ids'])
             _root = _ids.pop('root')
+            _ids.pop(_LOOP_KEY, None)  # never expose the loop scope as an id
             _new_ids = _root.ids
             for _key, _value in _ids.items():
                 if _value == _root:
@@ -1414,6 +1435,7 @@ class BuilderBase(object):
                         key = key[3:]
                     idmap = copy(global_idmap)
                     idmap.update(rctx['ids'])
+                    _merge_loop_scope(idmap)
                     idmap['self'] = widget_set.proxy_ref
                     if not widget_set.fbind(key, custom_callback, crule,
                                             idmap):

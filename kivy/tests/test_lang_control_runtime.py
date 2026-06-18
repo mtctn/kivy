@@ -306,6 +306,57 @@ BoxLayout:
         button_a.dispatch('on_press', None)
         self.assertEqual(root.picked, 'a')
 
+    def test_loop_target_shadows_metric_helper(self):
+        # 'dp' is a metric helper in the global kv context; as a loop
+        # target it must resolve to the loop value in child property
+        # expressions, not the helper function
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['x', 'y']
+    for dp in self.items:
+        Label:
+            text: dp
+''')
+        self.assertEqual(texts(root), ['x', 'y'])
+
+    def test_loop_target_shadows_global_in_handler(self):
+        # same precedence must hold on the handler eval path
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['x', 'y']
+    picked: ''
+    for dp in self.items:
+        Button:
+            text: dp
+            on_press: root.picked = dp
+''')
+        by_text(root)['y'].dispatch('on_press', None)
+        self.assertEqual(root.picked, 'y')
+
+    def test_loop_target_self_reshadowed_by_child_widget(self):
+        # a loop target named 'self' is shadowed again by each child
+        # widget's own 'self', so 'self.x' refers to the widget
+        root = Builder.load_string('''
+BoxLayout:
+    names: ['a', 'b']
+    for self in self.names:
+        Label:
+            text: self.__class__.__name__
+''')
+        self.assertEqual(texts(root), ['Label', 'Label'])
+
+    def test_nested_for_loop_scopes_compose(self):
+        # inner loop sees its own and the enclosing loop's variables
+        root = Builder.load_string('''
+BoxLayout:
+    rows: [['a', 'b'], ['c']]
+    for row in self.rows:
+        for cell in row:
+            Label:
+                text: '%s:%s' % (len(row), cell)
+''')
+        self.assertEqual(texts(root), ['2:a', '2:b', '1:c'])
+
     def test_multiple_children_per_iteration(self):
         root = Builder.load_string('''
 BoxLayout:

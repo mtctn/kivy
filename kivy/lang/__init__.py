@@ -520,8 +520,8 @@ children. If the items themselves are
 view-models), expressions such as ``item.title`` rebind per iteration as
 usual.
 
-The optional ``key:`` directive must be the first entry of the block and
-gives each iteration a stable identity: when the iterable changes, an
+The optional ``key:`` directive gives each iteration a stable identity:
+when the iterable changes, an
 iteration whose key is still present and whose loop values are unchanged
 keeps its widgets (moving them if the order changed); everything else is
 destroyed and rebuilt. Without ``key:`` the position in the iterable is
@@ -566,9 +566,13 @@ Restrictions:
   ``text: 'a' if condition else 'b'``.
 - ``id`` is not allowed on any widget inside a control block or routed
   into a slot, since the widget may not exist when the id is accessed.
-- Loop targets cannot shadow the reserved names (``self``, ``root``,
-  ``app``, ``args`` and the metric helpers), and assignment expressions
-  (``:=``) are not allowed in headers.
+- Loop targets form their own scope and may shadow any name, including
+  ``self``/``root``/``app`` and the metric helpers: within the block the
+  loop variable wins over the global kv context. A child widget's own
+  ``self`` (and a handler's ``args``) still take precedence inside that
+  widget, so shadowing ``self`` only affects the block's structure, not
+  the children's expressions. Assignment expressions (``:=``) are not
+  allowed in headers.
 - A slot cannot be defined inside a ``for`` block, slot fills must be
   direct children of the widget instance (put an ``if`` *inside* the
   fill to make its content conditional), and a ``slot:`` fill block

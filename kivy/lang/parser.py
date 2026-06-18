@@ -56,13 +56,6 @@ lang_control_kw = re.compile(r'(if|elif|else|for|slot)(?![A-Za-z0-9_])')
 # reserved for future control statements; using them is a parse error
 lang_reserved_kw = re.compile(r'(while|match|case)(?![A-Za-z0-9_])')
 
-# names that a loop target may not shadow: load-bearing binding names and
-# the metric helpers injected in global_idmap (which take precedence over
-# rule-local names in handler idmaps)
-_control_forbidden_targets = {
-    'self', 'root', 'app', 'args',
-    'pt', 'inch', 'cm', 'mm', 'dp', 'sp', 'rgba'}
-
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
 _handlers = defaultdict(partial(defaultdict, list))
@@ -500,7 +493,7 @@ class ParserControlRule(ParserRule):
         self.iterator_prop = None
         #: ParserRuleProperty evaluating to the active branch index
         self.selector_prop = None
-        #: ParserRuleProperty of the reserved 'key:' directive (unused yet)
+        #: ParserRuleProperty of the optional 'key:' directive, or None
         self.key_prop = None
         #: Slot name ('' is the default slot)
         self.slot_name = ''
@@ -619,12 +612,10 @@ class ParserControlRule(ParserRule):
                 raise ParserException(
                     ctx, line, 'control statement block requires at least '
                     'one child widget')
-            if self.key_prop is not None and \
-                    self.key_prop.line > min(c.line for c in self.children):
-                raise ParserException(
-                    ctx, self.key_prop.line,
-                    '"key:" must be declared before any widget of the '
-                    '"for" block')
+            # "key:" is a property; like every kv property it must precede
+            # the block's child widgets. kv enforces that structurally at
+            # parse time (a property after a child is "Invalid data after
+            # declaration"), so no extra check is needed here.
             self.iterator_prop.precompile()
             if self.key_prop is not None:
                 self.key_prop.precompile()
@@ -897,11 +888,6 @@ class Parser(object):
             raise ParserException(
                 self, ln, '"async for" is not supported in kv')
         names = self._collect_target_names(ln, comp.target)
-        forbidden = [n for n in names if n in _control_forbidden_targets]
-        if forbidden:
-            raise ParserException(
-                self, ln, 'loop target cannot shadow the reserved name(s) '
-                '%s' % ', '.join(map(repr, forbidden)))
         target_src = ast.get_source_segment(src, comp.target)
         iter_src = ast.get_source_segment(src, comp.iter)
         if_srcs = [ast.get_source_segment(src, c) for c in comp.ifs]
