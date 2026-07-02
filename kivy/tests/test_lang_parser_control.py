@@ -1,5 +1,5 @@
 '''
-Tests for parsing kv control statements (if/elif/else).
+Tests for parsing kv control statements (if/elif/else, for).
 
 These only cover the parser stage (:class:`kivy.lang.parser.Parser`);
 builder/runtime behavior is tested separately.
@@ -82,6 +82,57 @@ class ControlStatementParseTestCase(unittest.TestCase):
         Label:
 ''', '"else" must immediately follow')
 
+    def test_for_with_tuple_target_filter_and_key(self):
+        ctl = parse_rule('''
+<W@Widget>:
+    for item, index in enumerate(self.items) if item.visible:
+        key: item.uid
+        Label:
+            text: str(item)
+''').children[0]
+        self.assertEqual(ctl.kind, 'for')
+        self.assertEqual(ctl.target_names, ['item', 'index'])
+        self.assertEqual(
+            ctl.iterator_prop.value,
+            '[(item, index,) for item, index in (enumerate(self.items))'
+            ' if (item.visible)]')
+        self.assertEqual(ctl.key_prop.value, 'item.uid')
+        self.assertEqual(len(ctl.children), 1)
+
+    def test_for_watched_keys_exclude_loop_targets(self):
+        ctl = parse_rule('''
+<W@Widget>:
+    for item in self.items if item.visible and root.active:
+        key: item.uid
+        Label:
+''').children[0]
+        self.assertEqual(
+            sorted(map(tuple, ctl.iterator_prop.watched_keys)),
+            [('root', 'active'), ('self', 'items')])
+        self.assertIsNone(ctl.key_prop.watched_keys)
+
+    def test_for_star_target(self):
+        ctl = parse_rule('''
+<W@Widget>:
+    for first, *rest in self.rows:
+        Label:
+''').children[0]
+        self.assertEqual(ctl.target_names, ['first', 'rest'])
+
+    def test_nested_controls(self):
+        rule = parse_rule('''
+<W@Widget>:
+    for row in self.rows:
+        BoxLayout:
+            if row.title:
+                Label:
+                    text: row.title
+''')
+        outer = rule.children[0]
+        box = outer.children[0]
+        self.assertTrue(box.has_controls)
+        self.assertEqual(box.children[0].kind, 'if')
+
     def test_colon_inside_condition_braces(self):
         ctl = parse_rule('''
 <W@Widget>:
@@ -156,6 +207,15 @@ class ControlStatementParseTestCase(unittest.TestCase):
         Label:
 ''', '"else" must immediately follow')
 
+    def test_else_after_for(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for x in self.items:
+        Label:
+    else:
+        Label:
+''', '"else" after "for" is not supported')
+
     def test_non_control_keywords_rejected(self):
         # while/match/case are not kv control statements; they fall through to
         # the ordinary class/property path and are rejected as invalid names.
@@ -191,6 +251,28 @@ if True:
         Label:
 ''', 'assignment expressions')
 
+    def test_loop_target_may_shadow_reserved_names(self):
+        # loop targets form their own scope and may shadow any name,
+        # including self/root/app and the metric helpers (resolved at
+        # runtime; here we only assert the parser accepts them)
+        for name in ('self', 'root', 'app', 'dp', 'cm', 'rgba'):
+            ctl = parse_rule('''
+<W@Widget>:
+    for %s in self.items:
+        Label:
+''' % name).children[0]
+            self.assertEqual(ctl.target_names, [name])
+
+    def test_key_must_precede_widgets(self):
+        # "key:" is a property; like all kv properties it must come before
+        # the block's child widgets (kv rejects any property after a child)
+        self.assert_parse_error('''
+<W@Widget>:
+    for item in self.items:
+        Label:
+        key: item.uid
+''', 'Invalid data after declaration')
+
     def test_property_inside_if_allowed(self):
         rule = parse_rule('''
 <W@Widget>:
@@ -200,6 +282,92 @@ if True:
         branch = rule.children[0].branches[0]
         self.assertIn('text', branch.properties)
         self.assertEqual(branch.children, [])
+
+    def test_property_inside_for_is_a_local(self):
+        # a for body property is an iteration-local: extracted out of
+        # ``properties`` into ``locals`` with a scope key, and references to
+        # it rewritten to attribute access on that scope
+        rule = parse_rule('''
+<W@Widget>:
+    for i in self.items:
+        doubled: i * 2
+        Label:
+            text: str(doubled)
+''')
+        ctl = rule.children[0]
+        self.assertNotIn('doubled', ctl.properties)
+        self.assertEqual([n for n, _ in ctl.locals], ['doubled'])
+        self.assertIsNotNone(ctl.scope_key)
+        # the child reference is rewritten to <scope>.doubled
+        child = ctl.children[0]
+        self.assertIn(ctl.scope_key, child.properties['text'].value)
+
+    def test_for_with_only_a_local_and_no_child_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        n: i
+''', 'requires at least one child widget')
+
+    def test_for_handler_and_canvas_still_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        on_x: print(i)
+        Label:
+''', 'event handlers are not allowed')
+
+    def test_property_in_if_inside_for_is_conditional_local(self):
+        # nearest-scope rule: a property line binds to the nearest enclosing
+        # scope, so in an ``if`` nested in a ``for`` it is an iteration-local
+        # (bound while the branch is active), not a host property
+        rule = parse_rule('''
+<W@Widget>:
+    for n in self.items:
+        if n > 2:
+            label: 'big ' + str(n)
+        Label:
+            text: label or ''
+''')
+        ctl = rule.children[0]
+        self.assertIn('label', ctl.scope_names)
+        self.assertNotIn('label', [x for x, _ in ctl.locals])
+        child = ctl.children[-1]
+        self.assertIn(ctl.scope_key, child.properties['text'].value)
+
+    def test_handler_in_if_inside_for_forbidden(self):
+        # nesting context semantics: an ``if`` under a ``for`` follows the
+        # for-body content rules, so host handlers stay forbidden
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        if i:
+            on_touch_down: pass
+            Label:
+        Label:
+''', 'event handlers are not allowed')
+
+    def test_canvas_in_if_inside_for_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        if i:
+            canvas:
+                Color:
+            Label:
+        Label:
+''', 'canvas is not allowed')
+
+    def test_local_and_id_name_clash_is_error(self):
+        # one name cannot be driven by both a local binding and an id: both
+        # writers would stay live (this is not Python shadowing)
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        total: i * 2
+        Label:
+            id: total
+''', 'clashes')
 
     def test_full_body_inside_if_allowed(self):
         # children + property + canvas + handler all live in one branch
@@ -251,6 +419,22 @@ if True:
         btn = rule.children[1]
         self.assertIn(rule.id_scope_key, btn.properties['disabled'].value)
 
+    def test_id_inside_for_is_iteration_scoped(self):
+        # a widget id inside a for is redirected onto the per-iteration scope
+        rule = parse_rule('''
+<W@Widget>:
+    for it in self.items:
+        Label:
+            id: lab
+        Button:
+            text: lab.text
+''')
+        ctl = rule.children[0]
+        self.assertIsNotNone(ctl.scope_key)
+        self.assertEqual(ctl.id_scope_names, ['lab'])
+        self.assertEqual(ctl.children[0].scope_id, (ctl.scope_key, 'lab'))
+        self.assertIn(ctl.scope_key, ctl.children[1].properties['text'].value)
+
     def test_id_deep_inside_if_is_collected(self):
         rule = parse_rule('''
 <W@Widget>:
@@ -283,6 +467,14 @@ if True:
         self.assertEqual(len(branch.handlers), 1)
         self.assertEqual(branch.handlers[0].name, 'on_touch_down')
 
+    def test_handler_inside_for_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        on_touch_down: pass
+        Label:
+''', 'event handlers are not allowed')
+
     def test_canvas_inside_if_allowed(self):
         rule = parse_rule('''
 <W@Widget>:
@@ -293,6 +485,33 @@ if True:
 ''')
         branch = rule.children[0].branches[0]
         self.assertIsNotNone(branch.canvas_root)
+
+    def test_canvas_inside_for_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for i in self.items:
+        canvas:
+            Color:
+        Label:
+''', 'canvas is not allowed')
+
+    def test_control_inside_canvas_allowed(self):
+        rule = parse_rule('''
+<W@Widget>:
+    canvas:
+        Color:
+        for p in self.points:
+            Line:
+                points: p
+        if self.selected:
+            Rectangle:
+''')
+        children = rule.canvas_root.children
+        self.assertEqual(children[0].name, 'Color')
+        self.assertEqual(children[1].kind, 'for')
+        self.assertTrue(children[1].in_canvas)
+        self.assertEqual(children[2].kind, 'if')
+        self.assertTrue(children[2].in_canvas)
 
     def test_property_inside_canvas_control_forbidden(self):
         self.assert_parse_error('''
@@ -327,6 +546,13 @@ if True:
     Label:
 ''', 'requires at least one child widget')
 
+    def test_empty_for_body(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for x in self.items:
+    Label:
+''', 'requires at least one child widget')
+
     def test_missing_colon(self):
         self.assert_parse_error('''
 <W@Widget>:
@@ -355,6 +581,20 @@ if True:
     else self.y:
         Label:
 ''', '"else" takes no expression')
+
+    def test_multiple_for_clauses_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    for x in self.a for y in self.b:
+        Label:
+''', 'single "for ... in ..." clause')
+
+    def test_async_for_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    async for x in self.items:
+        Label:
+''', '')
 
 
 if __name__ == '__main__':

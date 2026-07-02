@@ -50,7 +50,7 @@ lang_key = re.compile('([a-zA-Z_]+)')
 lang_keyvalue = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]+)')
 lang_tr = re.compile(r'(_\()')
 lang_cls_split_pat = re.compile(', *')
-lang_control = re.compile(r'(if|elif|else)\b')
+lang_control = re.compile(r'(if|elif|else|for)\b')
 
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
@@ -467,13 +467,15 @@ class ParserControlBranch(ParserRule):
 
 
 class ParserControlRule(ParserRule):
-    '''A control statement (an ``if`` chain)
+    '''A control statement (``if`` chain or ``for``)
     at child position in a rule. The body is parsed with the ordinary rule
     machinery; :class:`Parser` finalizes it (chain merging, scope resolution,
     reference rewriting) before precompilation.
     '''
 
-    __slots__ = ('kind', 'branches', 'selector_prop', 'in_canvas',
+    __slots__ = ('kind', 'branches', 'selector_prop', 'iterator_prop',
+                 'key_prop', 'target_names',
+                 'locals', 'scope_key', 'scope_names', 'in_canvas',
                  'header_src')
 
     def __init__(self, ctx, line, kind, level):
@@ -486,6 +488,19 @@ class ParserControlRule(ParserRule):
         self.branches = []
         #: if: expression giving the index of the active branch (-1: none)
         self.selector_prop = None
+        #: for: expression giving the list of loop-value tuples
+        self.iterator_prop = None
+        #: for: per-iteration key expression (evaluated during reconcile)
+        self.key_prop = None
+        #: for: loop target names, in order
+        self.target_names = []
+        #: for: [(name, ParserRuleProperty)] iteration-locals, in order
+        self.locals = []
+        #: for: name of the per-iteration scope in expressions
+        self.scope_key = None
+        #: for: every name living on the iteration scope (targets, locals,
+        #: conditional locals, ids)
+        self.scope_names = []
         #: True when the block generates graphics instructions
         self.in_canvas = False
 
@@ -493,8 +508,22 @@ class ParserControlRule(ParserRule):
         super(ParserControlRule, self).precompile()
         for branch in self.branches:
             branch.precompile()
-        if self.selector_prop is not None:
-            self.selector_prop.precompile()
+        for prop in (self.selector_prop, self.iterator_prop,
+                     self.key_prop):
+            if prop is not None:
+                prop.precompile()
+        for _, prop in self.locals:
+            prop.precompile()
+        # keys rooted at a loop target are loop-local, not bindable
+        if self.iterator_prop is not None and self.iterator_prop.watched_keys:
+            targets = set(self.target_names)
+            wk = [k for k in self.iterator_prop.watched_keys
+                  if k[0] not in targets]
+            self.iterator_prop.watched_keys = wk or None
+        if self.key_prop is not None:
+            # the key is evaluated per iteration during reconcile; it never
+            # binds on its own
+            self.key_prop.watched_keys = None
 
 
 class _ScopeRewriter(ast.NodeTransformer):
@@ -926,6 +955,8 @@ class Parser(object):
             if expr:
                 raise ParserException(self, ln, '"else" takes no expression')
             ctl.header_src = None
+        else:  # for
+            self._parse_for_header(ln, ctl, head)
         return ctl
 
     def _split_control_header(self, ln, content):
@@ -977,6 +1008,57 @@ class Parser(object):
                 self, ln, 'assignment expressions (":=") are not allowed in '
                 'control statement headers')
 
+    def _parse_for_header(self, ln, ctl, head):
+        # `head` is the raw header ("for x, y in expr if cond"); parse it
+        # through Python's comprehension grammar
+        src = '[None %s]' % head
+        try:
+            tree = ast.parse(src, mode='eval')
+        except SyntaxError as e:
+            raise ParserException(
+                self, ln, 'invalid "for" header (%s); the header takes a '
+                'single "for ... in ..." clause with comprehension syntax'
+                % e)
+        self._forbid_walrus(ln, tree)
+        generators = tree.body.generators
+        if len(generators) != 1:
+            raise ParserException(
+                self, ln, 'a "for" header takes a '
+                'single "for ... in ..." clause')
+        gen = generators[0]
+        if gen.is_async:
+            raise ParserException(
+                self, ln, '"async for" is not allowed in kv')
+
+        names = []
+
+        def collect(node):
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+            elif isinstance(node, ast.Starred):
+                collect(node.value)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    collect(elt)
+            else:
+                raise ParserException(
+                    self, ln, 'invalid loop target in "for" header')
+
+        collect(gen.target)
+        if len(set(names)) != len(names):
+            raise ParserException(
+                self, ln, 'duplicate loop target in "for" header')
+
+        targets_src = ast.get_source_segment(src, gen.target)
+        iter_src = ast.get_source_segment(src, gen.iter)
+        filters = ''.join(
+            ' if (%s)' % ast.get_source_segment(src, f) for f in gen.ifs)
+        value = '[(%s,) for %s in (%s)%s]' % (
+            ', '.join(names), targets_src, iter_src, filters)
+        ctl.target_names = names
+        ctl.iterator_prop = ParserRuleProperty(
+            self, ln, '__kv_iterator', value)
+
     #
     # Control statements: finalization (chain merging, scope resolution,
     # reference rewriting). Runs after parse_level, before precompile.
@@ -1025,6 +1107,13 @@ class Parser(object):
                 child.in_canvas = in_canvas
                 if child.kind in ('elif', 'else'):
                     prev = out[-1] if out else None
+                    if (child.kind == 'else' and
+                            isinstance(prev, ParserControlRule) and
+                            prev.kind == 'for'):
+                        raise ParserException(
+                            self, child.line, '"else" after "for" is not '
+                            'supported; use a paired "if not ..." block for '
+                            'the empty state')
                     if (not isinstance(prev, ParserControlRule) or
                             prev.kind != 'if' or
                             prev.branches[-1].cond_src is None):
@@ -1158,6 +1247,8 @@ class Parser(object):
             self._rewrite_prop(ctl.selector_prop, env)
             for branch in ctl.branches:
                 self._walk_branch(branch, env, for_ctl)
+        elif kind == 'for':
+            self._walk_for(ctl, env)
 
     def _walk_branch(self, branch, env, for_ctl):
         if branch.id:
@@ -1174,7 +1265,97 @@ class Parser(object):
             raise ParserException(
                 self, branch.line, 'an "if" block requires at least one '
                 'child widget, property, handler or canvas')
+        if for_ctl is not None:
+            # nesting context semantics: the branch follows for-body rules
+            if branch.handlers:
+                raise ParserException(
+                    self, branch.handlers[0].line, 'event handlers are not '
+                    'allowed in a "for" block')
+            if (branch.canvas_root or branch.canvas_before or
+                    branch.canvas_after):
+                raise ParserException(
+                    self, branch.line, 'canvas is not allowed in a "for" '
+                    'block')
         self._walk_rule(branch, env, for_ctl)
+
+    def _walk_for(self, ctl, env):
+        if ctl.handlers:
+            raise ParserException(
+                self, ctl.handlers[0].line, 'event handlers are not allowed '
+                'in a "for" block (declare them on a child widget instead)')
+        if ctl.canvas_root or ctl.canvas_before or ctl.canvas_after:
+            raise ParserException(
+                self, ctl.line, 'canvas is not allowed in a "for" block '
+                '(declare it on a child widget instead)')
+        if not ctl.children:
+            raise ParserException(
+                self, ctl.line, 'a "for" block requires at least one child '
+                'widget')
+        self._rewrite_prop(ctl.iterator_prop, env)
+
+        # the iteration scope: loop targets, locals, conditional locals
+        # (from nested ifs) and ids
+        ctl.key_prop = ctl.properties.pop('key', None)
+        ctl.locals = list(ctl.properties.items())
+        ctl.properties = OrderedDict()
+        cond_locals = []
+        self._collect_cond_locals(ctl.children, cond_locals)
+        ids = []
+        self._collect_for_ids(ctl.children, ids)
+        names = list(ctl.target_names)
+        for name, _ in ctl.locals + cond_locals:
+            if name not in names:
+                names.append(name)
+        id_names = []
+        for name, crule in ids:
+            if name in names:
+                raise ParserException(
+                    self, crule.line, 'id %r clashes with a loop target or '
+                    'local of the same "for" block' % name)
+            if name not in id_names:
+                id_names.append(name)
+        ctl.scope_key = key = self._new_scope_key()
+        ctl.scope_names = names + id_names
+        ctl.id_scope_names = id_names
+        for name, crule in ids:
+            crule.id = None
+            crule.scope_id = (key, name)
+
+        inner_env = dict(env)
+        for name in ctl.scope_names:
+            inner_env[name] = key
+        for name, prop in ctl.locals:
+            prop.force_code = True
+            self._rewrite_prop(prop, inner_env)
+        for child in ctl.children:
+            if isinstance(child, ParserControlRule):
+                self._walk_control(child, inner_env, ctl)
+            else:
+                stripped = {k: v for k, v in inner_env.items()
+                            if k not in ('self', 'args')}
+                self._walk_rule(child, stripped, None)
+
+    def _collect_cond_locals(self, children, out):
+        for child in children:
+            if isinstance(child, ParserControlRule) and child.kind == 'if':
+                for branch in child.branches:
+                    for name, prop in branch.properties.items():
+                        if name != 'key':
+                            prop.force_code = True
+                            out.append((name, prop))
+                    self._collect_cond_locals(branch.children, out)
+
+    def _collect_for_ids(self, children, out):
+        for child in children:
+            if isinstance(child, ParserControlRule):
+                if child.kind == 'if':
+                    for branch in child.branches:
+                        self._collect_for_ids(branch.children, out)
+                # nested 'for': its own scope; 'slot': forbidden in for
+            else:
+                if child.id:
+                    out.append((self._clean_id(child.id, child), child))
+                self._collect_for_ids(child.children, out)
 
     def _walk_canvas(self, canvas_rule, env):
         for child in canvas_rule.children:
@@ -1201,6 +1382,23 @@ class Parser(object):
                         self, prop.line, 'only graphics instructions are '
                         'allowed inside canvas control statements')
                 self._walk_canvas(branch, env)
+            return
+        # for
+        ctl.key_prop = ctl.properties.pop('key', None)
+        if ctl.properties or ctl.handlers:
+            prop = (list(ctl.properties.values()) + ctl.handlers)[0]
+            raise ParserException(
+                self, prop.line, 'only graphics instructions are allowed '
+                'inside canvas control statements')
+        if not ctl.children:
+            raise ParserException(
+                self, ctl.line, 'a "for" block requires at least one '
+                'graphics instruction')
+        self._rewrite_prop(ctl.iterator_prop, env)
+        # loop targets are injected as plain names at build time
+        inner_env = {k: v for k, v in env.items()
+                     if k not in ctl.target_names}
+        self._walk_canvas(ctl, inner_env)
 
     def _rewrite_prop(self, prop, env):
         if not env or prop is None:

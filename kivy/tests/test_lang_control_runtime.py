@@ -1,5 +1,5 @@
 '''
-Runtime tests for kv control statements (if/elif/else).
+Runtime tests for kv control statements (if/elif/else, for).
 
 These cover the builder stage; pure parsing is tested in
 ``test_lang_parser_control.py``.
@@ -442,6 +442,490 @@ BoxLayout:
         self.assertEqual(len(_handlers.get(root.uid, {}).get('a', ())), 1)
 
 
+class ForRuntimeTestCase(unittest.TestCase):
+
+    def test_initial_build_in_order(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b', 'c']
+    Label:
+        text: 'head'
+    for item in self.items:
+        Label:
+            text: item
+    Label:
+        text: 'tail'
+''')
+        self.assertEqual(texts(root), ['head', 'a', 'b', 'c', 'tail'])
+
+    def test_positional_keys_reuse_unchanged_prefix(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b']
+    for item in self.items:
+        Label:
+            text: item
+''')
+        first = by_text(root)
+        root.items = ['a', 'b', 'c']
+        second = by_text(root)
+        self.assertEqual(texts(root), ['a', 'b', 'c'])
+        self.assertIs(first['a'], second['a'])
+        self.assertIs(first['b'], second['b'])
+
+    def test_keyed_reorder_preserves_identity(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b', 'c']
+    for item in self.items:
+        key: item
+        Label:
+            text: item
+''')
+        before = by_text(root)
+        root.items = ['c', 'a', 'b']
+        after = by_text(root)
+        self.assertEqual(texts(root), ['c', 'a', 'b'])
+        for k in 'abc':
+            self.assertIs(before[k], after[k])
+
+    def test_keyed_remove_and_add(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b', 'c']
+    for item in self.items:
+        key: item
+        Label:
+            text: item
+''')
+        before = by_text(root)
+        root.items = ['c', 'd']
+        after = by_text(root)
+        self.assertEqual(texts(root), ['c', 'd'])
+        self.assertIs(before['c'], after['c'])
+
+    def test_empty_iterable_and_refill(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: []
+    for item in self.items:
+        Label:
+            text: item
+    Label:
+        text: 'end'
+''')
+        self.assertEqual(texts(root), ['end'])
+        root.items = ['x']
+        self.assertEqual(texts(root), ['x', 'end'])
+        root.items = []
+        self.assertEqual(texts(root), ['end'])
+
+    def test_tuple_target_and_filter(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b', 'c']
+    for item, i in zip(self.items, range(99)) if item != 'b':
+        Label:
+            text: '%s%d' % (item, i)
+''')
+        self.assertEqual(texts(root), ['a0', 'c2'])
+
+    def test_loop_variable_in_handler(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b']
+    picked: ''
+    for item in self.items:
+        Button:
+            text: item
+            on_press: root.picked = item
+''')
+        button_a = by_text(root)['a']
+        button_a.dispatch('on_press', None)
+        self.assertEqual(root.picked, 'a')
+
+    def test_loop_target_shadows_metric_helper(self):
+        # 'dp' is a metric helper in the global kv context; as a loop
+        # target it must resolve to the loop value in child property
+        # expressions, not the helper function
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['x', 'y']
+    for dp in self.items:
+        Label:
+            text: dp
+''')
+        self.assertEqual(texts(root), ['x', 'y'])
+
+    def test_loop_target_shadows_global_in_handler(self):
+        # same precedence must hold on the handler eval path
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['x', 'y']
+    picked: ''
+    for dp in self.items:
+        Button:
+            text: dp
+            on_press: root.picked = dp
+''')
+        by_text(root)['y'].dispatch('on_press', None)
+        self.assertEqual(root.picked, 'y')
+
+    def test_loop_target_self_reshadowed_by_child_widget(self):
+        # a loop target named 'self' is shadowed again by each child
+        # widget's own 'self', so 'self.x' refers to the widget
+        root = Builder.load_string('''
+BoxLayout:
+    names: ['a', 'b']
+    for self in self.names:
+        Label:
+            text: self.__class__.__name__
+''')
+        self.assertEqual(texts(root), ['Label', 'Label'])
+
+    def test_nested_for_loop_scopes_compose(self):
+        # inner loop sees its own and the enclosing loop's variables
+        root = Builder.load_string('''
+BoxLayout:
+    rows: [['a', 'b'], ['c']]
+    for row in self.rows:
+        for cell in row:
+            Label:
+                text: '%s:%s' % (len(row), cell)
+''')
+        self.assertEqual(texts(root), ['2:a', '2:b', '1:c'])
+
+    def test_multiple_children_per_iteration(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b']
+    for item in self.items:
+        Label:
+            text: item + '1'
+        Label:
+            text: item + '2'
+''')
+        self.assertEqual(texts(root), ['a1', 'a2', 'b1', 'b2'])
+
+    def test_for_inside_if(self):
+        root = Builder.load_string('''
+BoxLayout:
+    show: True
+    items: ['x', 'y']
+    if self.show:
+        for item in self.items:
+            Label:
+                text: item
+    Label:
+        text: 'end'
+''')
+        self.assertEqual(texts(root), ['x', 'y', 'end'])
+        root.items = ['x', 'y', 'z']
+        self.assertEqual(texts(root), ['x', 'y', 'z', 'end'])
+        root.show = False
+        self.assertEqual(texts(root), ['end'])
+        root.show = True
+        self.assertEqual(texts(root), ['x', 'y', 'z', 'end'])
+
+    def test_if_inside_for_reacts_per_item(self):
+        from kivy.uix.widget import Widget
+        from kivy.properties import StringProperty, BooleanProperty
+
+        class FItem(Widget):
+            name = StringProperty('')
+            special = BooleanProperty(False)
+
+        root = Builder.load_string('''
+BoxLayout:
+    models: []
+    for item in self.models:
+        Label:
+            text: item.name
+        if item.special:
+            Label:
+                text: item.name + '!'
+''')
+        a = FItem(name='a')
+        b = FItem(name='b', special=True)
+        root.models = [a, b]
+        self.assertEqual(texts(root), ['a', 'b', 'b!'])
+        a.special = True
+        self.assertEqual(texts(root), ['a', 'a!', 'b', 'b!'])
+        b.special = False
+        self.assertEqual(texts(root), ['a', 'a!', 'b'])
+
+    def test_nested_for(self):
+        root = Builder.load_string('''
+BoxLayout:
+    rows: [['a', 'b'], ['c']]
+    for row in self.rows:
+        for cell in row:
+            Label:
+                text: cell
+''')
+        self.assertEqual(texts(root), ['a', 'b', 'c'])
+        root.rows = [['x'], ['y', 'z']]
+        self.assertEqual(texts(root), ['x', 'y', 'z'])
+
+    def test_duplicate_key_raises(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b']
+    for item in self.items:
+        key: item
+        Label:
+            text: item
+''')
+        with self.assertRaises(BuilderException) as cm:
+            root.items = ['a', 'a']
+        self.assertIn('duplicate', str(cm.exception))
+
+    def test_unhashable_key_raises(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: []
+    for item in self.items:
+        key: item
+        Label:
+            text: str(item)
+''')
+        with self.assertRaises(BuilderException) as cm:
+            root.items = [['unhashable']]
+        self.assertIn('hashable', str(cm.exception))
+
+    def test_cross_widget_reentrant_rebuild(self):
+        # a handler firing during one widget's build mutates state that
+        # another widget's node (sharing the same class rule) watches;
+        # the second rebuild must be deferred, not re-enter _apply_rule
+        root = Builder.load_string('''
+<ReentryRow@BoxLayout>:
+    items: []
+    poke: False
+    for item in self.items:
+        Label:
+            text: str(item)
+            on_parent:
+                (setattr(root.parent.children[0], 'items', ['p'])
+                if root.poke and root.parent
+                and not root.parent.children[0].items else None)
+BoxLayout:
+    ReentryRow:
+    ReentryRow:
+''')
+        row1, row2 = root.children[1], root.children[0]
+        row1.poke = True
+        row1.items = ['a']
+        self.assertEqual(texts(row1), ['a'])
+        self.assertEqual(texts(row2), ['p'])
+
+    def test_pure_append_does_not_detach_existing(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: ['a', 'b']
+    for item in self.items:
+        key: item
+        Label:
+            text: item
+''')
+        removals = []
+        orig = root.remove_widget
+
+        def tracking_remove(w):
+            removals.append(w)
+            orig(w)
+
+        root.remove_widget = tracking_remove
+        root.items = ['a', 'b', 'c']
+        self.assertEqual(removals, [])
+        self.assertEqual(texts(root), ['a', 'b', 'c'])
+
+    def test_no_handler_leak_on_updates(self):
+        root = Builder.load_string('''
+BoxLayout:
+    items: []
+    for item in self.items:
+        Label:
+            text: item
+''')
+        root.items = ['a', 'b', 'c']
+        baseline = set(_handlers)
+        for i in range(30):
+            root.items = ['a', str(i)]
+            root.items = ['a', 'b', 'c']
+        # anything new in the registry must belong to the live subtree
+        live = {w.uid for w in root.walk(restrict=True)}
+        leaked = set(_handlers) - baseline - live
+        self.assertEqual(leaked, set())
+
+    def test_for_body_local_is_reactive_intermediate(self):
+        # a for body property is an iteration-local reactive value, not a
+        # host property: it is computed per iteration and read by the body
+        from kivy.factory import Factory
+        from kivy.uix.label import Label
+        from kivy.properties import NumericProperty
+
+        class QItem(Label):
+            qty = NumericProperty(0)
+
+        Builder.load_string('''
+<LocReact@BoxLayout>:
+    items: []
+    for it in self.items:
+        doubled: it.qty * 2
+        Label:
+            text: str(doubled)
+''', filename='locreact.kv')
+        try:
+            w = Factory.LocReact()
+            a, b = QItem(qty=1), QItem(qty=5)
+            w.items = [a, b]
+            self.assertEqual(texts(w), ['2', '10'])
+            # changing a dependency recomputes the local, which updates the
+            # widget that reads it
+            a.qty = 9
+            self.assertEqual(texts(w), ['18', '10'])
+            # the local is NOT a host property
+            self.assertFalse(hasattr(w, 'doubled'))
+        finally:
+            Builder.unload_file('locreact.kv')
+
+    def test_for_body_local_value_is_shared_within_iteration(self):
+        # a `[]` local is one object per iteration, shared by every
+        # reference in that iteration; different iterations get their own
+        from kivy.factory import Factory
+        Builder.load_string('''
+<LocShared@BoxLayout>:
+    items: [1, 2]
+    for it in self.items:
+        bucket: []
+        Label:
+            tag: bucket
+        Label:
+            tag: bucket
+''', filename='locshared.kv')
+        try:
+            w = Factory.LocShared()
+            a, b, c, d = list(reversed(w.children))
+            self.assertIs(a.tag, b.tag)        # shared within iteration 0
+            self.assertIs(c.tag, d.tag)        # shared within iteration 1
+            self.assertIsNot(a.tag, c.tag)     # distinct across iterations
+            a.tag.append(99)                   # mutation is visible to both
+            self.assertEqual(b.tag, [99])
+            self.assertEqual(c.tag, [])
+        finally:
+            Builder.unload_file('locshared.kv')
+
+    def test_if_inside_for_reads_loop_local(self):
+        # an if branch inside a for sees the loop's locals
+        from kivy.factory import Factory
+        Builder.load_string('''
+<IfLocal@BoxLayout>:
+    items: []
+    for n in self.items:
+        big: n > 2
+        if big:
+            Label:
+                text: 'big:' + str(n)
+        else:
+            Label:
+                text: 'small:' + str(n)
+''', filename='iflocal.kv')
+        try:
+            w = Factory.IfLocal()
+            w.items = [1, 5]
+            self.assertEqual(texts(w), ['small:1', 'big:5'])
+        finally:
+            Builder.unload_file('iflocal.kv')
+
+    def test_local_references_earlier_local(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<LocChain@BoxLayout>:
+    items: [10, 20]
+    for x in self.items:
+        a: x + 1
+        b: a * 100
+        Label:
+            text: str(b)
+''', filename='locchain.kv')
+        try:
+            w = Factory.LocChain()
+            self.assertEqual(texts(w), ['1100', '2100'])
+        finally:
+            Builder.unload_file('locchain.kv')
+
+    def test_same_key_new_value_keeps_widgets_and_redispatches(self):
+        # reconciliation rule: same key => same widgets; the new loop values
+        # are re-dispatched through the existing bindings, so live widget
+        # state survives an item being replaced under a stable key
+        root = Builder.load_string('''
+BoxLayout:
+    tasks: [{'uid': 1, 'txt': 'a'}, {'uid': 2, 'txt': 'b'}]
+    for task in self.tasks:
+        key: task['uid']
+        Label:
+            text: task['txt']
+''')
+        first = list(reversed(root.children))
+        self.assertEqual(texts(root), ['a', 'b'])
+        root.tasks = [{'uid': 1, 'txt': 'a2'}, {'uid': 2, 'txt': 'b'}]
+        self.assertEqual(texts(root), ['a2', 'b'])
+        self.assertEqual(list(reversed(root.children)), first)
+
+    def test_conditional_local_in_for(self):
+        # nearest-scope rule: a property in an ``if`` inside a ``for`` is an
+        # iteration-local bound while the branch is active; it starts None,
+        # keeps its last value when the branch leaves (one-way), and never
+        # touches the host
+        from kivy.uix.widget import Widget
+        from kivy.properties import NumericProperty
+
+        class CItem(Widget):
+            n = NumericProperty(0)
+
+        root = Builder.load_string('''
+BoxLayout:
+    models: []
+    for it in self.models:
+        if it.n > 2:
+            biglabel: 'big ' + str(it.n)
+        Label:
+            text: biglabel or 'none'
+''')
+        a = CItem(n=1)
+        root.models = [a]
+        self.assertEqual(texts(root), ['none'])
+        a.n = 5
+        self.assertEqual(texts(root), ['big 5'])
+        a.n = 1
+        self.assertEqual(texts(root), ['big 5'])  # one-way: last value kept
+        self.assertFalse(hasattr(root, 'biglabel'))
+
+    def test_non_iterable_raises_with_kv_context(self):
+        # Python semantics: iterating a non-iterable raises; the error must
+        # carry the kv rule location, not surface as a bare TypeError
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.properties import ObjectProperty
+
+        class AnyItems(BoxLayout):
+            items = ObjectProperty((1,))
+
+        Builder.load_string('''
+<AnyItems>:
+    for x in self.items:
+        Label:
+            text: str(x)
+''', filename='anyitems.kv')
+        try:
+            w = AnyItems()
+            self.assertEqual(texts(w), ['1'])
+            with self.assertRaises(BuilderException) as cm:
+                w.items = 5
+            self.assertIn('not iterable', str(cm.exception))
+        finally:
+            Builder.unload_file('anyitems.kv')
+
+
 class ControlIdRuntimeTestCase(unittest.TestCase):
     '''Reactive ids inside control blocks: an id in an ``if`` is reachable
     across the rule and is None while its branch is inactive; an id in a
@@ -487,6 +971,48 @@ class ControlIdRuntimeTestCase(unittest.TestCase):
             self.assertNotIn('hidden', w.ids)
         finally:
             Builder.unload_file('idnoleak.kv')
+
+    def test_for_id_reachable_by_sibling_in_iteration(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<IdRows@BoxLayout>:
+    items: ['a', 'b']
+    for it in self.items:
+        Label:
+            id: lab
+            text: it
+        Button:
+            text: 'echo:' + lab.text
+''', filename='idrows.kv')
+        try:
+            w = Factory.IdRows()
+            self.assertEqual(
+                texts(w), ['a', 'echo:a', 'b', 'echo:b'])
+            # the iteration-local id is not exposed on root.ids
+            self.assertNotIn('lab', w.ids)
+        finally:
+            Builder.unload_file('idrows.kv')
+
+    def test_id_in_if_inside_for_is_iteration_local(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<IdIfFor@BoxLayout>:
+    items: []
+    for n in self.items:
+        if n > 0:
+            Label:
+                id: pos
+                text: 'p' + str(n)
+        Button:
+            text: 'has' if pos is not None else 'none'
+''', filename='idiffor.kv')
+        try:
+            w = Factory.IdIfFor()
+            w.items = [5, -1]
+            # iter 0: pos mounted -> 'has'; iter 1: branch off -> None
+            self.assertEqual(texts(w), ['p5', 'has', 'none'])
+        finally:
+            Builder.unload_file('idiffor.kv')
 
     def test_complementary_chains_can_share_an_id(self):
         # `if cond:` / `if not cond:` may define the same id: the id follows
@@ -582,6 +1108,17 @@ class ControlStatementGCTestCase(unittest.TestCase):
         self.assertTrue(collected)
         self.assertTrue(clean)
 
+    def test_for_widget_is_collected(self):
+        collected, _ = self._collected('''
+<GcProbe@BoxLayout>:
+    flag: True
+    items: [1, 2, 3]
+    for x in self.items:
+        Label:
+            text: str(x)
+''')
+        self.assertTrue(collected)
+
     def test_many_rows_collected_after_clear(self):
         import gc
         import weakref
@@ -644,6 +1181,91 @@ class CanvasControlRuntimeTestCase(unittest.TestCase):
     '''``if`` and ``for`` work inside a canvas block, managing graphics
     instructions reactively and in document position.'''
 
+    def test_for_in_canvas_builds_and_reacts(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<ForCanvas@Widget>:
+    pts: [1, 2, 3]
+    canvas:
+        Color:
+        for p in self.pts:
+            Rectangle:
+''', filename='for_canvas.kv')
+        try:
+            w = Factory.ForCanvas()
+            self.assertEqual(
+                _canvas_types(w.canvas),
+                ['Color', 'Rectangle', 'Rectangle', 'Rectangle'])
+            w.pts = [1, 2]
+            self.assertEqual(
+                _canvas_types(w.canvas), ['Color', 'Rectangle', 'Rectangle'])
+            w.pts = []
+            self.assertEqual(_canvas_types(w.canvas), ['Color'])
+        finally:
+            Builder.unload_file('for_canvas.kv')
+
+    def test_canvas_for_keyed_preserves_instruction_identity(self):
+        # with `key:` a canvas `for` keeps/moves/rebuilds per-iteration
+        # instruction groups instead of rebuilding wholesale
+        from kivy.factory import Factory
+        Builder.load_string('''
+<KeyedForCanvas@Widget>:
+    items: [1, 2, 3]
+    canvas:
+        Color:
+        for it in self.items:
+            key: it
+            Line:
+                points: (it, it)
+''', filename='keyed_for_canvas.kv')
+        try:
+            w = Factory.KeyedForCanvas()
+            leaves = _canvas_leaves(w.canvas)
+            self.assertEqual([type(i).__name__ for i in leaves],
+                             ['Color', 'Line', 'Line', 'Line'])
+            color = leaves[0]
+            lines = leaves[1:]            # for keys 1, 2, 3 in order
+
+            # reorder: same Line objects, new draw order
+            w.items = [3, 1, 2]
+            self.assertEqual(
+                _canvas_leaves(w.canvas),
+                [color, lines[2], lines[0], lines[1]])
+
+            # remove a key: its Line is gone, the others are untouched
+            w.items = [3, 1]
+            self.assertEqual(
+                _canvas_leaves(w.canvas), [color, lines[2], lines[0]])
+
+            # add a key: a fresh Line, the kept ones still identical
+            w.items = [3, 1, 9]
+            after = _canvas_leaves(w.canvas)
+            self.assertEqual(after[:3], [color, lines[2], lines[0]])
+            self.assertEqual(type(after[3]).__name__, 'Line')
+            self.assertNotIn(after[3], lines)
+        finally:
+            Builder.unload_file('keyed_for_canvas.kv')
+
+    def test_canvas_for_keyed_no_op_on_unchanged(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<KeyedForCanvas2@Widget>:
+    items: [1, 2]
+    tick: 0
+    canvas:
+        for it in self.items:
+            key: it
+            Line:
+''', filename='keyed_for_canvas2.kv')
+        try:
+            w = Factory.KeyedForCanvas2()
+            before = _canvas_leaves(w.canvas)
+            # reassigning an equal list must not rebuild the instructions
+            w.items = [1, 2]
+            self.assertEqual(_canvas_leaves(w.canvas), before)
+        finally:
+            Builder.unload_file('keyed_for_canvas2.kv')
+
     def test_if_in_canvas_switches_instructions(self):
         from kivy.factory import Factory
         Builder.load_string('''
@@ -665,6 +1287,55 @@ class CanvasControlRuntimeTestCase(unittest.TestCase):
             self.assertEqual(_canvas_types(w.canvas), ['Color', 'Line'])
         finally:
             Builder.unload_file('if_canvas.kv')
+
+    def test_canvas_control_keeps_document_position(self):
+        # instructions after the control block stay after it
+        from kivy.factory import Factory
+        Builder.load_string('''
+<PosCanvas@Widget>:
+    pts: []
+    canvas:
+        Color:
+        for p in self.pts:
+            Rectangle:
+        Line:
+''', filename='pos_canvas.kv')
+        try:
+            w = Factory.PosCanvas()
+            self.assertEqual(_canvas_types(w.canvas), ['Color', 'Line'])
+            w.pts = [1, 2]
+            self.assertEqual(
+                _canvas_types(w.canvas),
+                ['Color', 'Rectangle', 'Rectangle', 'Line'])
+        finally:
+            Builder.unload_file('pos_canvas.kv')
+
+    def test_nested_for_in_if_in_canvas(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<NestCanvas@Widget>:
+    on: True
+    pts: [1, 2]
+    canvas:
+        if self.on:
+            Color:
+            for p in self.pts:
+                Line:
+''', filename='nest_canvas.kv')
+        try:
+            w = Factory.NestCanvas()
+            self.assertEqual(
+                _canvas_types(w.canvas), ['Color', 'Line', 'Line'])
+            w.pts = [1, 2, 3]
+            self.assertEqual(
+                _canvas_types(w.canvas), ['Color', 'Line', 'Line', 'Line'])
+            w.on = False
+            self.assertEqual(_canvas_types(w.canvas), [])
+            w.on = True
+            self.assertEqual(
+                _canvas_types(w.canvas), ['Color', 'Line', 'Line', 'Line'])
+        finally:
+            Builder.unload_file('nest_canvas.kv')
 
     def test_instruction_property_binding_in_canvas_control(self):
         from kivy.factory import Factory
@@ -697,6 +1368,48 @@ class CanvasControlRuntimeTestCase(unittest.TestCase):
             self.assertAlmostEqual(color.rgba[3], 0.9)
         finally:
             Builder.unload_file('bind_canvas.kv')
+
+    def test_no_handler_leak_on_canvas_rebuild(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<LeakCanvas@Widget>:
+    pts: [1]
+    canvas:
+        for p in self.pts:
+            Color:
+                rgba: 1, 0, 0, p
+''', filename='leak_canvas.kv')
+        try:
+            w = Factory.LeakCanvas()
+            for i in range(30):
+                w.pts = [1, 2, 3]
+                w.pts = [1]
+            n = sum(len(v) for v in _handlers.get(w.uid, {}).values())
+            # one live Color binding per current instruction (here 1)
+            self.assertLessEqual(n, 1)
+        finally:
+            Builder.unload_file('leak_canvas.kv')
+
+    def test_canvas_control_widget_is_collected(self):
+        import gc
+        import weakref
+        from kivy.factory import Factory
+        Builder.load_string('''
+<GcCanvas@Widget>:
+    pts: [1, 2, 3]
+    canvas:
+        for p in self.pts:
+            Rectangle:
+''', filename='gc_canvas.kv')
+        try:
+            w = Factory.GcCanvas()
+            w.pts = [1, 2]
+            ref = weakref.ref(w)
+            del w
+            gc.collect()
+            self.assertIsNone(ref())
+        finally:
+            Builder.unload_file('gc_canvas.kv')
 
 
 class ControlRegressionTestCase(unittest.TestCase):
@@ -773,6 +1486,98 @@ class ControlRegressionTestCase(unittest.TestCase):
         finally:
             Builder.unload_file('reapply.kv')
 
+    def test_constant_key_reports_duplicate_not_typeerror(self):
+        with self.assertRaises(BuilderException) as cm:
+            Builder.load_string('''
+BoxLayout:
+    items: [1, 2]
+    for x in self.items:
+        key: 5
+        Label:
+            text: str(x)
+''')
+        self.assertIn('duplicate', str(cm.exception))
+
+    def test_for_body_local_does_not_touch_host_property(self):
+        # a for-body local is iteration-scoped and never writes the host
+        # property of the same name (which keeps tracking its own binding)
+        root = Builder.load_string('''
+BoxLayout:
+    src: 10
+    n: self.src * 2
+    items: [100, 200]
+    for i in self.items:
+        n: i
+        Label:
+            text: str(n)
+''')
+        self.assertEqual(root.n, 20)        # host n untouched by the local
+        self.assertEqual(texts(root), ['100', '200'])
+        root.src = 5
+        self.assertEqual(root.n, 10)        # host binding still live
+
+    def test_for_local_scopes_unbound_on_iteration_removal(self):
+        # each iteration's scope object owns the local bindings; removing an
+        # iteration tears its scope down (no leftover handler entries)
+        from kivy.lang.parser import _handlers
+        root = Builder.load_string('''
+BoxLayout:
+    offset: 0
+    items: [1, 2, 3]
+    for i in self.items:
+        key: i
+        n: i + root.offset
+        Label:
+            text: str(n)
+''')
+        def n_scopes():
+            return sum(1 for uid in list(_handlers) if 'n' in _handlers[uid])
+
+        before = n_scopes()
+        root.items = [1, 3]                 # remove the middle iteration
+        # exactly one iteration scope (and its 'n' binding) is torn down
+        self.assertEqual(before - n_scopes(), 1)
+
+    def test_for_with_props_widget_is_collected(self):
+        import gc
+        import weakref
+        from kivy.factory import Factory
+        Builder.load_string('''
+<ForPropGc@BoxLayout>:
+    n: 0
+    items: [1, 2]
+    for i in self.items:
+        n: i
+        Label:
+            text: str(i)
+''', filename='forpropgc.kv')
+        try:
+            w = Factory.ForPropGc()
+            ref = weakref.ref(w)
+            del w
+            gc.collect()
+            self.assertIsNone(ref())
+        finally:
+            Builder.unload_file('forpropgc.kv')
+
+    def test_exception_mid_canvas_build_leaves_clean_rulectx(self):
+        from kivy.lang.builder import Builder as B
+        from kivy.factory import Factory
+        Builder.load_string('''
+<BadCanvas@Widget>:
+    zero: 0
+    canvas:
+        for i in [1, 2]:
+            Color:
+                rgba: 1 / self.zero, 0, 0, 1
+''', filename='badcanvas.kv')
+        try:
+            with self.assertRaises(BuilderException):
+                Factory.BadCanvas()      # canvas build divides by zero
+            self.assertEqual(dict(B.rulectx), {})
+        finally:
+            B.unload_file('badcanvas.kv')
+
 
 class CanvasRegressionTestCase(unittest.TestCase):
 
@@ -793,6 +1598,28 @@ class CanvasRegressionTestCase(unittest.TestCase):
             w.on = True
         finally:
             Builder.unload_file('clearcanvas.kv')
+
+    def test_control_in_canvas_before_and_after(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<BACanvas@Widget>:
+    pts: [1, 2]
+    canvas.before:
+        for p in self.pts:
+            Rectangle:
+    canvas.after:
+        if self.pts:
+            Line:
+''', filename='bacanvas.kv')
+        try:
+            w = Factory.BACanvas()
+            self.assertEqual(
+                _canvas_types(w.canvas.before), ['Rectangle', 'Rectangle'])
+            self.assertEqual(_canvas_types(w.canvas.after), ['Line'])
+            w.pts = [1]
+            self.assertEqual(_canvas_types(w.canvas.before), ['Rectangle'])
+        finally:
+            Builder.unload_file('bacanvas.kv')
 
     def test_branch_canvas_zorder_follows_document_order(self):
         from kivy.factory import Factory
@@ -816,6 +1643,23 @@ class CanvasRegressionTestCase(unittest.TestCase):
             self.assertEqual(_canvas_types(w.canvas), ['Scale', 'Rotate'])
         finally:
             Builder.unload_file('zorder.kv')
+
+    def test_canvas_for_skips_rebuild_when_unchanged(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<ForSkip@Widget>:
+    pts: [1, 2]
+    canvas:
+        for p in self.pts:
+            Rectangle:
+''', filename='forskip.kv')
+        try:
+            w = Factory.ForSkip()
+            before = list(w.canvas.children)
+            w.pts = [1, 2]               # equal value -> no rebuild
+            self.assertEqual(list(w.canvas.children), before)  # same objects
+        finally:
+            Builder.unload_file('forskip.kv')
 
 
 if __name__ == '__main__':

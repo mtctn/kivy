@@ -636,6 +636,175 @@ class IfNode(_ControlNode):
         super(IfNode, self).teardown()
 
 
+class _Iteration(object):
+    __slots__ = ('key', 'values', 'scope', 'items', 'detached')
+
+    def __init__(self, key, values, scope, items):
+        self.key = key
+        self.values = values
+        self.scope = scope
+        self.items = items
+        self.detached = None
+
+
+class ForNode(_ControlNode):
+    '''A ``for`` block: one copy of the body per item, reconciled as the
+    iterable changes. Same key => same widgets: the loop targets live as
+    reactive properties on a per-iteration scope, so a kept key with new
+    values just re-dispatches them through the existing bindings.'''
+
+    def __init__(self, *largs, **kwargs):
+        super(ForNode, self).__init__(*largs, **kwargs)
+        self.iterations = []
+
+    def iter_items(self):
+        for rec in self.iterations:
+            for it in rec.items:
+                yield it
+
+    def activate(self, rule_children=None, pos=None):
+        self._bind_expr(self.ctl.iterator_prop)
+        self._active = True
+        self._reconcile(rule_children, pos)
+
+    def _run_update(self):
+        self._reconcile(None, None)
+
+    def _reconcile(self, rule_children, pos):
+        builder = self.builder
+        host = self.host
+        ctl = self.ctl
+        tuples = list(self.value or ())
+        keys = self._compute_keys(tuples)
+        recs = self.iterations
+        old_by_key = {rec.key: rec for rec in recs}
+        new_keys = set(keys)
+        for rec in recs[:]:
+            if rec.key not in new_keys:
+                self._destroy_iteration(rec)
+                recs.remove(rec)
+        moved = [rec.key for rec in recs] != [
+            k for k in keys if k in old_by_key]
+        if moved:
+            for rec in recs:
+                self._detach(rec)
+        if pos is None:
+            pos = self._position()
+        built = rule_children if rule_children is not None else []
+        cursor = pos
+        new_recs = []
+        targets = ctl.target_names
+        for key, tup in zip(keys, tuples):
+            rec = old_by_key.get(key)
+            if rec is not None:
+                if moved:
+                    cursor += self._reattach(rec, cursor)
+                else:
+                    cursor += _items_count(rec.items)
+                scope = rec.scope
+                for name, v in zip(targets, tup):
+                    setattr(scope, name, v)
+                rec.values = tup
+            else:
+                rec = self._build_iteration(key, tup, cursor, built)
+                cursor += _items_count(rec.items)
+            new_recs.append(rec)
+        self.iterations = new_recs
+        self._dispatch_kv_post(rule_children, built)
+
+    def _compute_keys(self, tuples):
+        ctl = self.ctl
+        prop = ctl.key_prop
+        if prop is None:
+            return list(range(len(tuples)))
+        co = prop.co_value
+        if type(co) is not CodeType:
+            keys = [co] * len(tuples)
+        else:
+            base = copy(self.idmap)
+            base.update(global_idmap)
+            base['self'] = self.host.proxy_ref
+            targets = ctl.target_names
+            keys = []
+            for tup in tuples:
+                idmap = dict(base)
+                idmap.update(zip(targets, tup))
+                try:
+                    keys.append(eval(co, idmap))
+                except Exception as e:
+                    tb = sys.exc_info()[2]
+                    raise BuilderException(
+                        prop.ctx, prop.line,
+                        '{}: {}'.format(e.__class__.__name__, e), cause=tb)
+        seen = set()
+        for key in keys:
+            try:
+                duplicate = key in seen
+                seen.add(key)
+            except TypeError as e:
+                tb = sys.exc_info()[2]
+                raise BuilderException(
+                    ctl.ctx, ctl.line, 'keys of a "for" block must be '
+                    'hashable ({})'.format(e), cause=tb)
+            if duplicate:
+                raise BuilderException(
+                    ctl.ctx, ctl.line,
+                    'duplicate key %r in "for" block' % (key,))
+        return keys
+
+    def _build_iteration(self, key, tup, cursor, built):
+        builder = self.builder
+        host = self.host
+        ctl = self.ctl
+        scope = _make_scope(ctl.scope_names)
+        for name, v in zip(ctl.target_names, tup):
+            setattr(scope, name, v)
+        idmap = dict(self.idmap)
+        idmap[ctl.scope_key] = scope
+        host_proxy = host.proxy_ref
+        for name, prop in ctl.locals:
+            co = prop.co_value
+            if type(co) is CodeType:
+                v, _ = create_handler(
+                    scope, scope, name, co, prop, idmap, self_ref=host_proxy)
+            else:
+                v = co
+            setattr(scope, name, v)
+        log = builder._scope_id_log
+        n = len(log)
+        items = builder._build_items(
+            host, ctl.children, idmap, cursor, built, scope)
+        del log[n:]
+        return _Iteration(key, tup, scope, items)
+
+    def _destroy_iteration(self, rec):
+        self.builder._teardown_items(self.host, rec.items)
+        self.builder.unbind_widget(rec.scope.uid)
+
+    def _detach(self, rec):
+        widgets = []
+        _collect_item_widgets(rec.items, widgets)
+        host = self.host
+        for w in widgets:
+            host.remove_widget(w)
+        rec.detached = widgets
+
+    def _reattach(self, rec, cursor):
+        widgets = rec.detached or []
+        rec.detached = None
+        index = self._insert_index(cursor)
+        host = self.host
+        for w in widgets:
+            host.add_widget(w, index=index)
+        return len(widgets)
+
+    def teardown(self):
+        for rec in self.iterations:
+            self._destroy_iteration(rec)
+        self.iterations = []
+        super(ForNode, self).teardown()
+
+
 class _CanvasNode(_ControlNode):
     '''Base for canvas control nodes: owns one InstructionGroup slotted at
     the block's position in the enclosing canvas (or group).'''
@@ -689,6 +858,117 @@ class CanvasIfNode(_CanvasNode):
         self.builder._build_canvas_content(
             self.group, self.host, branches[index], self.idmap,
             self._captured, self._subnodes)
+
+
+class _CanvasSub(object):
+    __slots__ = ('group', 'values', 'captured', 'subnodes')
+
+    def __init__(self, group):
+        self.group = group
+        self.values = None
+        self.captured = []
+        self.subnodes = []
+
+
+class CanvasForNode(_CanvasNode):
+    '''A canvas ``for``. Without ``key:`` the group is rebuilt wholesale;
+    with it, per-iteration sub-groups are kept, moved or rebuilt by key.'''
+
+    def __init__(self, *largs, **kwargs):
+        super(CanvasForNode, self).__init__(*largs, **kwargs)
+        self.subs = {}
+        self._order = []
+
+    def activate(self, rule_children=None, pos=None):
+        self._bind_expr(self.ctl.iterator_prop)
+        self._active = True
+        self._mount()
+
+    def _run_update(self):
+        self._mount()
+
+    def _content_idmap(self, tup):
+        idmap = dict(self.idmap)
+        idmap.update(zip(self.ctl.target_names, tup))
+        return idmap
+
+    def _mount(self):
+        global InstructionGroup
+        builder = self.builder
+        ctl = self.ctl
+        tuples = list(self.value or ())
+        if ctl.key_prop is None:
+            self._clear_content()
+            for tup in tuples:
+                builder._build_canvas_content(
+                    self.group, self.host, ctl, self._content_idmap(tup),
+                    self._captured, self._subnodes)
+            return
+        # keyed: reconcile per-iteration sub-groups
+        keys = ForNode._compute_keys(self, tuples)
+        if InstructionGroup is None:
+            from kivy.graphics import InstructionGroup
+        old = self.subs
+        new_keys = set(keys)
+        for key in list(old):
+            if key not in new_keys:
+                sub = old.pop(key)
+                self._destroy_sub(sub, remove=True)
+        self._order = [k for k in self._order if k in new_keys]
+        subs = {}
+        for key, tup in zip(keys, tuples):
+            sub = old.get(key)
+            if sub is None:
+                sub = _CanvasSub(InstructionGroup())
+                self.group.add(sub.group)
+                self._fill_sub(sub, tup)
+            elif sub.values != tup:
+                self._destroy_sub(sub, remove=False)
+                self._fill_sub(sub, tup)
+            subs[key] = sub
+        # kept groups sit in old order and new ones were appended in new
+        # order, so nothing moves when the kept order is a prefix of the new
+        if self._order != keys[:len(self._order)]:
+            for sub in subs.values():
+                try:
+                    self.group.remove(sub.group)
+                except Exception:
+                    pass
+            for key in keys:
+                self.group.add(subs[key].group)
+        self.subs = subs
+        self._order = keys
+
+    def _fill_sub(self, sub, tup):
+        sub.values = tup
+        self.builder._build_canvas_content(
+            sub.group, self.host, self.ctl, self._content_idmap(tup),
+            sub.captured, sub.subnodes)
+
+    def _destroy_sub(self, sub, remove):
+        for node in sub.subnodes:
+            node.teardown()
+        sub.subnodes = []
+        for key, captured in sub.captured:
+            _unbind_captured(self.host.uid, key, captured)
+        sub.captured = []
+        sub.group.clear()
+        if remove:
+            try:
+                self.group.remove(sub.group)
+            except Exception:
+                pass
+
+    def _clear_content(self):
+        for sub in self.subs.values():
+            self._destroy_sub(sub, remove=False)
+        self.subs = {}
+        self._order = []
+        super(CanvasForNode, self)._clear_content()
+
+    def teardown(self):
+        self._clear_content()
+        _ControlNode.teardown(self)
 
 
 class BuilderBase(object):
@@ -1261,7 +1541,9 @@ class BuilderBase(object):
 
     def _make_control_node(self, widget, ctl, ids, for_scope):
         kind = ctl.kind
-        return IfNode(self, widget, ctl, ids, for_scope=for_scope)
+        if kind == 'if':
+            return IfNode(self, widget, ctl, ids, for_scope=for_scope)
+        return ForNode(self, widget, ctl, ids)
 
     def _build_items(self, host, crules, ids, pos, rule_children, for_scope):
         '''Build the entries `crules` (widgets and nested control statements)
@@ -1348,7 +1630,9 @@ class BuilderBase(object):
                     from kivy.graphics import InstructionGroup
                 sub = InstructionGroup()
                 group.add(sub)
-                node = CanvasIfNode(self, widget, crule, ids, sub)
+                node_cls = (CanvasIfNode if crule.kind == 'if'
+                            else CanvasForNode)
+                node = node_cls(self, widget, crule, ids, sub)
                 subnodes.append(node)
                 node.activate()
                 continue
@@ -1553,7 +1837,9 @@ class BuilderBase(object):
                 if InstructionGroup is None:
                     from kivy.graphics import InstructionGroup
                 group = InstructionGroup()
-                node = CanvasIfNode(self, widget, crule, idmap, group)
+                node_cls = (CanvasIfNode if crule.kind == 'if'
+                            else CanvasForNode)
+                node = node_cls(self, widget, crule, idmap, group)
                 node.owner_rule = rootrule
                 widget.__dict__.setdefault(
                     '_kv_control_nodes', []).append(node)
@@ -1600,9 +1886,13 @@ if 'KIVY_PROFILE_LANG' in environ:
                 continue
             yield prp
         if isinstance(rule, ParserControlRule):
-            if (rule.selector_prop is not None and
-                    rule.selector_prop.line == index):
-                yield rule.selector_prop
+            for prp in (rule.selector_prop, rule.iterator_prop,
+                        rule.key_prop):
+                if prp is not None and prp.line == index:
+                    yield prp
+            for _, prp in rule.locals:
+                if prp.line == index:
+                    yield prp
             for branch in rule.branches:
                 for r in match_rule(fn, index, branch):
                     yield r
