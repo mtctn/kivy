@@ -6,8 +6,10 @@ Class used for the parsing of .kv files into rules.
 '''
 import os
 
+import io
 import re
 import sys
+import tokenize
 import traceback
 import ast
 import importlib
@@ -23,7 +25,8 @@ from kivy.resources import resource_find
 from kivy.utils import rgba
 import kivy.metrics as Metrics
 
-__all__ = ('Parser', 'ParserException')
+__all__ = ('Parser', 'ParserException', 'ParserControlRule',
+           'ParserControlBranch')
 
 
 trace = Logger.trace
@@ -47,6 +50,7 @@ lang_key = re.compile('([a-zA-Z_]+)')
 lang_keyvalue = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]+)')
 lang_tr = re.compile(r'(_\()')
 lang_cls_split_pat = re.compile(', *')
+lang_control = re.compile(r'(if|elif|else)\b')
 
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
@@ -141,7 +145,8 @@ class ParserRuleProperty(object):
     '''
 
     __slots__ = ('ctx', 'line', 'name', 'value', 'co_value',
-                 'watched_keys', 'mode', 'count', 'ignore_prev')
+                 'watched_keys', 'mode', 'count', 'ignore_prev',
+                 'force_code')
 
     def __init__(self, ctx, line, name, value, ignore_prev=False):
         super(ParserRuleProperty, self).__init__()
@@ -163,6 +168,9 @@ class ParserRuleProperty(object):
         self.count = 0
         #: whether previous rules targeting name should be cleared
         self.ignore_prev = ignore_prev
+        #: always compile to a code object, even for a constant expression
+        #: (an iteration-local like `[]` must evaluate freshly per iteration)
+        self.force_code = False
 
     def precompile(self):
         name = self.name
@@ -175,7 +183,7 @@ class ParserRuleProperty(object):
         mode = self.mode
         if self.mode is None:
             self.mode = mode = 'exec' if name[:3] == 'on_' else 'eval'
-        if mode == 'eval':
+        if mode == 'eval' and not self.force_code:
             # if we don't detect any string/key in it, we can eval and give the
             # result
             if re.search(lang_key, tmp) is None:
@@ -301,7 +309,8 @@ class ParserRule(object):
 
     __slots__ = ('ctx', 'line', 'name', 'children', 'id', 'properties',
                  'canvas_before', 'canvas_root', 'canvas_after',
-                 'handlers', 'level', 'cache_marked', 'avoid_previous_rules')
+                 'handlers', 'level', 'cache_marked', 'avoid_previous_rules',
+                 'has_controls', 'id_scope_key', 'id_scope_names', 'scope_id')
 
     def __init__(self, ctx, line, name, level):
         super(ParserRule, self).__init__()
@@ -331,6 +340,14 @@ class ParserRule(object):
         self.cache_marked = []
         #: Indicate if any previous rules should be avoided.
         self.avoid_previous_rules = False
+        #: True if any direct child is a control statement (fast-path test)
+        self.has_controls = False
+        #: Key and names of the rule-level reactive-id scope (ids declared
+        #: inside `if` branches and `slot` blocks of this rule)
+        self.id_scope_key = None
+        self.id_scope_names = []
+        #: (scope_key, name) when this widget's id lives on a scope object
+        self.scope_id = None
 
         if level == 0:
             self._detect_selectors()
@@ -436,6 +453,112 @@ class ParserRule(object):
         return '<ParserRule name=%r>' % (self.name, )
 
 
+class ParserControlBranch(ParserRule):
+    '''One branch of an ``if`` / ``elif`` / ``else`` chain: a full rule body
+    (children, properties, handlers, canvas) plus the branch condition.
+    '''
+
+    __slots__ = ('cond_src',)
+
+    def __init__(self, ctx, line, level, cond_src):
+        super(ParserControlBranch, self).__init__(ctx, line, 'branch', level)
+        #: Source of the condition; None for ``else``
+        self.cond_src = cond_src
+
+
+class ParserControlRule(ParserRule):
+    '''A control statement (an ``if`` chain)
+    at child position in a rule. The body is parsed with the ordinary rule
+    machinery; :class:`Parser` finalizes it (chain merging, scope resolution,
+    reference rewriting) before precompilation.
+    '''
+
+    __slots__ = ('kind', 'branches', 'selector_prop', 'in_canvas',
+                 'header_src')
+
+    def __init__(self, ctx, line, kind, level):
+        super(ParserControlRule, self).__init__(ctx, line, kind, level)
+        #: 'if', 'for', 'slot' or 'factory' ('elif'/'else' only pre-merge)
+        self.kind = kind
+        #: raw condition source for if/elif headers (None for else)
+        self.header_src = None
+        #: if: list of :class:`ParserControlBranch`
+        self.branches = []
+        #: if: expression giving the index of the active branch (-1: none)
+        self.selector_prop = None
+        #: True when the block generates graphics instructions
+        self.in_canvas = False
+
+    def precompile(self):
+        super(ParserControlRule, self).precompile()
+        for branch in self.branches:
+            branch.precompile()
+        if self.selector_prop is not None:
+            self.selector_prop.precompile()
+
+
+class _ScopeRewriter(ast.NodeTransformer):
+    '''Rewrite ``name`` to ``<scope_key>.name`` for scoped names, respecting
+    lambda and comprehension shadowing.
+    '''
+
+    def __init__(self, env):
+        super(_ScopeRewriter, self).__init__()
+        self.env = env
+        self.shadow = []
+        self.changed = False
+
+    def _shadowed(self, name):
+        return any(name in s for s in self.shadow)
+
+    def visit_Name(self, node):
+        if (isinstance(node.ctx, ast.Load) and node.id in self.env and
+                not self._shadowed(node.id)):
+            self.changed = True
+            return ast.copy_location(ast.Attribute(
+                value=ast.copy_location(
+                    ast.Name(id=self.env[node.id], ctx=ast.Load()), node),
+                attr=node.id, ctx=ast.Load()), node)
+        return node
+
+    def visit_Lambda(self, node):
+        args = node.args
+        # defaults evaluate in the enclosing scope
+        args.defaults = [self.visit(d) for d in args.defaults]
+        args.kw_defaults = [self.visit(d) if d is not None else None
+                            for d in args.kw_defaults]
+        names = {a.arg for a in args.args + args.posonlyargs + args.kwonlyargs}
+        if args.vararg:
+            names.add(args.vararg.arg)
+        if args.kwarg:
+            names.add(args.kwarg.arg)
+        self.shadow.append(names)
+        node.body = self.visit(node.body)
+        self.shadow.pop()
+        return node
+
+    def _visit_comp(self, node):
+        pushed = 0
+        for gen in node.generators:
+            gen.iter = self.visit(gen.iter)
+            self.shadow.append({n.id for n in ast.walk(gen.target)
+                                if isinstance(n, ast.Name)})
+            pushed += 1
+            gen.ifs = [self.visit(i) for i in gen.ifs]
+        if isinstance(node, ast.DictComp):
+            node.key = self.visit(node.key)
+            node.value = self.visit(node.value)
+        else:
+            node.elt = self.visit(node.elt)
+        del self.shadow[-pushed:]
+        return node
+
+    visit_ListComp = _visit_comp
+    visit_SetComp = _visit_comp
+    visit_DictComp = _visit_comp
+    visit_GeneratorExp = _visit_comp
+
+
 class Parser(object):
     '''Create a Parser object to parse a Kivy language file or Kivy content.
     '''
@@ -448,7 +571,7 @@ class Parser(object):
         list(range(ord('0'), ord('9') + 1)) + [ord('_')])
 
     __slots__ = ('rules', 'root', 'sourcecode',
-                 'directives', 'filename', 'dynamic_classes')
+                 'directives', 'filename', 'dynamic_classes', '_scope_count')
 
     def __init__(self, **kwargs):
         super(Parser, self).__init__()
@@ -457,6 +580,7 @@ class Parser(object):
         self.sourcecode = []
         self.directives = []
         self.dynamic_classes = {}
+        self._scope_count = 0
         self.filename = kwargs.get('filename', None)
         content = kwargs.get('content', None)
         if content is None:
@@ -573,7 +697,10 @@ class Parser(object):
         # Get object from the first level
         objects, remaining_lines = self.parse_level(0, lines)
 
-        # Precompile rules tree
+        # Finalize control statements (chain merging, scope resolution,
+        # reference rewriting), then precompile the rules tree
+        for rule in objects:
+            self._finalize_controls(rule)
         for rule in objects:
             rule.precompile()
 
@@ -639,6 +766,17 @@ class Parser(object):
 
             # Current level, create an object
             elif count == indent:
+                if lang_control.match(content):
+                    if count == 0:
+                        raise ParserException(
+                            self, ln, 'Control statements are not allowed at '
+                            'the top level of a kv file')
+                    current_object = self._parse_control_statement(
+                        ln, content, rlevel)
+                    current_property = None
+                    objects.append(current_object)
+                    i += 1
+                    continue
                 x = content.split(':', 1)
                 if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
@@ -659,6 +797,17 @@ class Parser(object):
 
             # Next level, is it a property or an object ?
             elif count == indent + spaces:
+                # a control statement is a child: recurse like a class child
+                if lang_control.match(content):
+                    _objects, _lines = self.parse_level(
+                        level + 1, lines[i:], spaces)
+                    if current_object is None:
+                        raise ParserException(self, ln, 'Invalid indentation')
+                    current_object.children = _objects
+                    current_property = None
+                    lines = _lines
+                    i = 1
+                    continue
                 x = content.split(':', 1)
                 if not x[0]:
                     raise ParserException(self, ln, 'Identifier missing')
@@ -756,6 +905,317 @@ class Parser(object):
             i += 1
 
         return objects, []
+
+    #
+    # Control statements: header parsing
+    #
+
+    def _parse_control_statement(self, ln, content, rlevel):
+        kind = lang_control.match(content).group(1)
+        head = self._split_control_header(ln, content)
+        expr = head[len(kind):].strip()
+        ctl = ParserControlRule(self, ln, kind, rlevel)
+
+        if kind in ('if', 'elif'):
+            if not expr:
+                raise ParserException(
+                    self, ln, '"%s" requires a condition expression' % kind)
+            self._check_header_expr(ln, expr)
+            ctl.header_src = expr
+        elif kind == 'else':
+            if expr:
+                raise ParserException(self, ln, '"else" takes no expression')
+            ctl.header_src = None
+        return ctl
+
+    def _split_control_header(self, ln, content):
+        '''Return the header (text before the block colon), rejecting inline
+        bodies. The colon is found at bracket depth 0, so colons inside
+        strings, dicts, slices or parenthesized lambdas are skipped.
+        '''
+        depth = 0
+        colon = None
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(content).readline)
+            for tok in tokens:
+                if tok.type != tokenize.OP:
+                    continue
+                if tok.string in '([{':
+                    depth += 1
+                elif tok.string in ')]}':
+                    depth -= 1
+                elif tok.string == ':' and depth == 0:
+                    # keep the last depth-0 colon, so a bare lambda in the
+                    # header keeps its own colon
+                    colon = tok.start[1]
+        except tokenize.TokenError:
+            pass
+        if colon is None:
+            raise ParserException(
+                self, ln, "expected ':' at the end of the control statement "
+                'header')
+        tail = content[colon + 1:].strip()
+        if tail and not tail.startswith('#'):
+            raise ParserException(
+                self, ln, "unexpected content after ':' in a control "
+                'statement (the body goes on the following lines)')
+        return content[:colon].rstrip()
+
+    def _check_header_expr(self, ln, expr):
+        try:
+            tree = ast.parse(expr, mode='eval')
+        except SyntaxError as e:
+            raise ParserException(
+                self, ln, 'invalid expression in control statement header '
+                '(%s)' % e)
+        self._forbid_walrus(ln, tree)
+        return tree
+
+    def _forbid_walrus(self, ln, tree):
+        if any(isinstance(n, ast.NamedExpr) for n in ast.walk(tree)):
+            raise ParserException(
+                self, ln, 'assignment expressions (":=") are not allowed in '
+                'control statement headers')
+
+    #
+    # Control statements: finalization (chain merging, scope resolution,
+    # reference rewriting). Runs after parse_level, before precompile.
+    #
+
+    def _new_scope_key(self):
+        key = '__kvscope_%d' % self._scope_count
+        self._scope_count += 1
+        return key
+
+    def _finalize_controls(self, rule):
+        self._merge_control_chains(rule, False)
+        # rule-level reactive-id scope: ids inside `if` branches and `slot`
+        # blocks of this rule (an id under a `for` goes to the iteration
+        # scope instead)
+        found, statics = [], []
+        self._collect_rule_ids(rule, found, statics)
+        env = {}
+        if found:
+            names = [n for n, _ in found]
+            for name in names:
+                if name in statics:
+                    raise ParserException(
+                        self, rule.line, 'reactive id %r clashes with a '
+                        'static id of the same rule' % name)
+            rule.id_scope_key = self._new_scope_key()
+            seen = set()
+            rule.id_scope_names = [
+                n for n in names if not (n in seen or seen.add(n))]
+            for name, crule in found:
+                crule.id = None
+                crule.scope_id = (rule.id_scope_key, name)
+            env = {n: rule.id_scope_key for n in rule.id_scope_names}
+        self._walk_rule(rule, env, None)
+
+    def _merge_control_chains(self, rule, in_canvas):
+        self._merge_list(rule.children, in_canvas)
+        for cv in (rule.canvas_before, rule.canvas_root, rule.canvas_after):
+            if cv is not None:
+                self._merge_list(cv.children, True)
+
+    def _merge_list(self, children, in_canvas):
+        out = []
+        for child in children:
+            if isinstance(child, ParserControlRule):
+                child.in_canvas = in_canvas
+                if child.kind in ('elif', 'else'):
+                    prev = out[-1] if out else None
+                    if (not isinstance(prev, ParserControlRule) or
+                            prev.kind != 'if' or
+                            prev.branches[-1].cond_src is None):
+                        raise ParserException(
+                            self, child.line, '"%s" must immediately follow '
+                            'an "if" or "elif" block' % child.kind)
+                    prev.branches.append(self._as_branch(child))
+                    continue
+                if child.kind == 'if':
+                    child.branches = [self._as_branch(child)]
+                    child.children = []
+                    child.properties = OrderedDict()
+                    child.handlers = []
+                    child.canvas_root = None
+                    child.canvas_before = None
+                    child.canvas_after = None
+                    child.id = None
+            out.append(child)
+        children[:] = out
+        for child in out:
+            if isinstance(child, ParserControlRule):
+                for branch in child.branches:
+                    self._merge_control_chains(branch, in_canvas)
+                self._merge_list(child.children, in_canvas)
+                for cv in (child.canvas_before, child.canvas_root,
+                           child.canvas_after):
+                    if cv is not None:
+                        self._merge_list(cv.children, True)
+                if child.kind == 'if':
+                    child.selector_prop = self._build_selector(child)
+            else:
+                self._merge_control_chains(child, in_canvas)
+
+    def _as_branch(self, ctl):
+        branch = ParserControlBranch(
+            self, ctl.line, ctl.level, ctl.header_src)
+        branch.children = ctl.children
+        branch.properties = ctl.properties
+        branch.handlers = ctl.handlers
+        branch.canvas_root = ctl.canvas_root
+        branch.canvas_before = ctl.canvas_before
+        branch.canvas_after = ctl.canvas_after
+        branch.id = ctl.id
+        return branch
+
+    def _build_selector(self, ctl):
+        conds = []
+        else_index = -1
+        for i, branch in enumerate(ctl.branches):
+            if branch.cond_src is None:
+                else_index = i
+            else:
+                conds.append('%d if (%s)' % (i, branch.cond_src))
+        value = ' else '.join(conds) + ' else %d' % else_index
+        return ParserRuleProperty(self, ctl.line, '__kv_selector', value)
+
+    def _clean_id(self, value, crule):
+        # same normalization as the builder: first word, comments dropped
+        name = value.split('#', 1)[0].strip()
+        if name == 'app':
+            # a scoped id is rewritten wherever it is referenced, so unlike
+            # a static id it would silently hijack the `app` proxy
+            raise ParserException(
+                self, crule.line,
+                'Invalid id, cannot be "self", "root" or "app"')
+        return name
+
+    def _collect_rule_ids(self, rule, found, statics):
+        '''Collect ids belonging to this rule's reactive-id scope: ids on
+        widgets inside `if` branches and `slot` blocks, at any depth, stopping
+        at `for` blocks (iteration scope) and rejecting ids in `factory`
+        bodies. Also collects the rule's static ids for clash detection.
+        '''
+        for child in rule.children:
+            if isinstance(child, ParserControlRule):
+                if child.kind == 'if':
+                    for branch in child.branches:
+                        self._collect_scoped_ids(branch, found)
+            else:
+                if child.id:
+                    statics.append(self._clean_id(child.id, child))
+                self._collect_rule_ids(child, found, statics)
+
+    def _collect_scoped_ids(self, rule, found):
+        for child in rule.children:
+            if isinstance(child, ParserControlRule):
+                if child.kind == 'if':
+                    for branch in child.branches:
+                        self._collect_scoped_ids(branch, found)
+            else:
+                if child.id:
+                    found.append((self._clean_id(child.id, child), child))
+                self._collect_scoped_ids(child, found)
+
+    #
+    # Control statements: validation, scopes and reference rewriting
+    #
+
+    def _walk_rule(self, rule, env, for_ctl):
+        '''Validate and rewrite one rule body (a widget rule, an if branch, a
+        factory body). `env` maps scoped names to their scope key; `for_ctl`
+        is the enclosing `for` when this body is (part of) its direct block.
+        '''
+        for prop in rule.properties.values():
+            self._rewrite_prop(prop, env)
+        for prop in rule.handlers:
+            self._rewrite_prop(prop, env)
+        for cv in (rule.canvas_before, rule.canvas_root, rule.canvas_after):
+            if cv is not None:
+                self._walk_canvas(cv, env)
+        rule.has_controls = any(
+            isinstance(c, ParserControlRule) for c in rule.children)
+        child_env = env
+        if env and ('self' in env or 'args' in env):
+            # a widget's own `self` (and a handler's `args`) win inside it
+            child_env = {k: v for k, v in env.items()
+                         if k not in ('self', 'args')}
+        for child in rule.children:
+            if isinstance(child, ParserControlRule):
+                self._walk_control(child, env, for_ctl)
+            else:
+                self._walk_rule(child, child_env, None)
+
+    def _walk_control(self, ctl, env, for_ctl):
+        kind = ctl.kind
+        if ctl.id:
+            raise ParserException(
+                self, ctl.line, '"id" is not allowed directly on a control '
+                'statement')
+        if kind == 'if':
+            self._rewrite_prop(ctl.selector_prop, env)
+            for branch in ctl.branches:
+                self._walk_branch(branch, env, for_ctl)
+
+    def _walk_branch(self, branch, env, for_ctl):
+        if branch.id:
+            raise ParserException(
+                self, branch.line, '"id" is not allowed directly on a '
+                'control statement')
+        if 'key' in branch.properties:
+            raise ParserException(
+                self, branch.properties['key'].line, '"key:" is only allowed '
+                'inside a "for" block')
+        if not (branch.children or branch.properties or branch.handlers or
+                branch.canvas_root or branch.canvas_before or
+                branch.canvas_after):
+            raise ParserException(
+                self, branch.line, 'an "if" block requires at least one '
+                'child widget, property, handler or canvas')
+        self._walk_rule(branch, env, for_ctl)
+
+    def _walk_canvas(self, canvas_rule, env):
+        for child in canvas_rule.children:
+            if isinstance(child, ParserControlRule):
+                self._walk_canvas_control(child, env)
+            else:
+                for prop in child.properties.values():
+                    self._rewrite_prop(prop, env)
+                if any(isinstance(c, ParserControlRule)
+                       for c in child.children):
+                    raise ParserException(
+                        self, child.line, 'a control statement is not '
+                        'allowed under a graphics instruction')
+
+    def _walk_canvas_control(self, ctl, env):
+        kind = ctl.kind
+        if kind == 'if':
+            self._rewrite_prop(ctl.selector_prop, env)
+            for branch in ctl.branches:
+                if branch.properties or branch.handlers:
+                    prop = (list(branch.properties.values()) +
+                            branch.handlers)[0]
+                    raise ParserException(
+                        self, prop.line, 'only graphics instructions are '
+                        'allowed inside canvas control statements')
+                self._walk_canvas(branch, env)
+
+    def _rewrite_prop(self, prop, env):
+        if not env or prop is None:
+            return
+        mode = 'exec' if prop.name[:3] == 'on_' else 'eval'
+        try:
+            tree = ast.parse(prop.value, mode=mode)
+        except SyntaxError:
+            # let precompile report it with the proper kv context
+            return
+        rewriter = _ScopeRewriter(env)
+        tree = rewriter.visit(tree)
+        if rewriter.changed:
+            ast.fix_missing_locations(tree)
+            prop.value = ast.unparse(tree)
 
 
 class ParserSelector(object):

@@ -9,6 +9,7 @@ from os import environ
 from os.path import join
 from copy import copy
 from types import CodeType
+from functools import partial
 
 from kivy.factory import Factory
 from kivy.lang.parser import (
@@ -17,12 +18,14 @@ from kivy.lang.parser import (
     _handlers,
     global_idmap,
     ParserRuleProperty,
+    ParserControlRule,
 )
 from kivy.logger import Logger
 from kivy import kivy_data_dir
 from kivy.context import register_context
 from kivy.resources import resource_find
 from kivy._event import Observable, EventDispatcher
+from kivy.properties import ObjectProperty
 
 __all__ = ('Observable', 'Builder', 'BuilderBase', 'BuilderException')
 
@@ -56,7 +59,17 @@ def call_fn(args, instance, v):
         trace('Lang: call_fn %s, key=%s, value=%r, %r' % (
             element, key, value, rule.value))
     rule.count += 1
-    e_value = eval(value, idmap)
+    try:
+        e_value = eval(value, idmap)
+    except (BuilderException, ReferenceError):
+        # a ReferenceError means a weak-referenced widget died before this
+        # (delayed) update ran; Builder.sync() relies on catching it as-is
+        raise
+    except Exception as e:
+        tb = sys.exc_info()[2]
+        raise BuilderException(
+            rule.ctx, rule.line,
+            '{}: {}'.format(e.__class__.__name__, e), cause=tb)
     if __debug__:
         trace('Lang: call_fn => value=%r' % (e_value, ))
     setattr(element, key, e_value)
@@ -167,10 +180,11 @@ def update_intermediates(base, keys, bound, s, fn, args, instance, value):
     fn(args, None, None)
 
 
-def create_handler(iself, element, key, value, rule, idmap, delayed=False):
+def create_handler(iself, element, key, value, rule, idmap, delayed=False,
+                   self_ref=None):
     idmap = copy(idmap)
     idmap.update(global_idmap)
-    idmap['self'] = iself.proxy_ref
+    idmap['self'] = self_ref if self_ref is not None else iself.proxy_ref
     bound_list = _handlers[iself.uid][key]
     handler_append = bound_list.append
 
@@ -240,6 +254,443 @@ def create_handler(iself, element, key, value, rule, idmap, delayed=False):
                                cause=tb)
 
 
+# ---------------------------------------------------------------------------
+# Control statements runtime
+#
+# Each control statement compiles to a small node owning a contiguous span of
+# its parent container (widget children or canvas instructions) and rebuilding
+# that span when its bound expression changes. Nodes live on the host widget
+# (never in a module registry), so control-using widgets stay collectable.
+# ---------------------------------------------------------------------------
+
+# late import (kivy.graphics must not load at module import time)
+InstructionGroup = None
+
+# scope classes cache, keyed by the tuple of property names
+_scope_classes = {}
+
+
+def _make_scope(names):
+    '''Build a hidden scope object: an EventDispatcher with one reactive,
+    nullable, rebindable property per name (loop targets, locals, ids).'''
+    key = tuple(names)
+    cls = _scope_classes.get(key)
+    if cls is None:
+        cls = type('KvScope', (EventDispatcher,), {
+            name: ObjectProperty(None, allownone=True, rebind=True)
+            for name in key})
+        _scope_classes[key] = cls
+    return cls()
+
+
+def _unbind_captured(uid, key, captured):
+    '''Unbind exactly the handler entries `captured` (as returned by
+    create_handler into ``_handlers[uid][key]``), leaving every other binding
+    of the property untouched.'''
+    plist = _handlers.get(uid)
+    entries = plist.get(key) if plist is not None else None
+    for bound in captured:
+        for f, k, fn, bound_uid in bound:
+            if fn is None:
+                continue
+            try:
+                f.unbind_uid(k, bound_uid)
+            except ReferenceError:
+                pass
+        if entries is not None and bound in entries:
+            entries.remove(bound)
+    if plist is not None and entries is not None and not entries:
+        del plist[key]
+        if not plist:
+            del _handlers[uid]
+
+
+def _items_count(items):
+    n = 0
+    for it in items:
+        if isinstance(it, _ControlNode):
+            n += it.count()
+        else:
+            n += 1
+    return n
+
+
+def _items_scan(items, target):
+    '''Return (position, found): the document position of `target` within
+    the entry structure `items` (descending into nodes).'''
+    pos = 0
+    for it in items:
+        if it is target:
+            return pos, True
+        if isinstance(it, _ControlNode):
+            sub, found = _items_scan(it.iter_items(), target)
+            pos += sub
+            if found:
+                return pos, True
+        else:
+            pos += 1
+    return pos, False
+
+
+def _collect_item_widgets(items, out):
+    for it in items:
+        if isinstance(it, _ControlNode):
+            _collect_item_widgets(it.iter_items(), out)
+        else:
+            out.append(it)
+
+
+class _ControlNode(EventDispatcher):
+    '''Base runtime node for a control statement.'''
+
+    value = ObjectProperty(None, allownone=True)
+
+    def __init__(self, builder, host, ctl, idmap, for_scope=None, **kwargs):
+        super(_ControlNode, self).__init__(**kwargs)
+        self.builder = builder
+        self.host = host
+        self.ctl = ctl
+        self.idmap = idmap
+        self.for_scope = for_scope
+        self.owner_rule = None
+        self._expr_captured = []
+        self._active = False
+
+    def iter_items(self):
+        return ()
+
+    def count(self):
+        return _items_count(self.iter_items())
+
+    def _position(self):
+        entries = self.host.__dict__.get('_kv_entries') or ()
+        pos, found = _items_scan(entries, self)
+        return pos
+
+    def _insert_index(self, pos):
+        children = self.host.children
+        return max(0, min(len(children), len(children) - pos))
+
+    def _bind_expr(self, prop):
+        co = prop.co_value
+        if type(co) is CodeType:
+            host = self.host
+            blist = _handlers[host.uid]['value']
+            n = len(blist)
+            value, _ = create_handler(
+                host, self, 'value', co, prop, self.idmap)
+            self._expr_captured = blist[n:]
+        else:
+            value = co
+        self.value = value
+        self.fbind('value', self._on_value)
+
+    def _on_value(self, *largs):
+        if not self._active:
+            return
+        builder = self.builder
+        if self in builder._node_queue:
+            return
+        builder._node_queue.append(self)
+        if not (builder._apply_depth or builder._processing):
+            builder._process_queues()
+
+    def _run_update(self):
+        pass
+
+    def teardown(self):
+        self._active = False
+        _unbind_captured(self.host.uid, 'value', self._expr_captured)
+        self._expr_captured = []
+        queue = self.builder._node_queue
+        if self in queue:
+            queue.remove(self)
+
+    def _dispatch_kv_post(self, rule_children, built):
+        # dynamic builds dispatch on_kv_post themselves; initial builds are
+        # dispatched by the outer apply through `rule_children`
+        if rule_children is None:
+            for w in built:
+                w.dispatch('on_kv_post', self.host)
+
+
+_canvas_attrs = ('canvas_before', 'canvas_root', 'canvas_after')
+
+
+class _CanvasMark(object):
+    '''Position bookmark for a conditional canvas group: registered once per
+    branch section in document order, mounted/unmounted with the branch so
+    inactive branches leave nothing in the canvas.'''
+
+    __slots__ = ('group', 'mounted')
+
+    def __init__(self, group):
+        self.group = group
+        self.mounted = False
+
+
+def _mark_register(host, canvas, mark):
+    # registration happens at node activation, i.e. in document order
+    host.__dict__.setdefault('_kv_canvas_marks', {}).setdefault(
+        canvas, []).append(mark)
+
+
+def _mark_mount(host, canvas, mark):
+    if mark.mounted:
+        return
+    marks = host.__dict__['_kv_canvas_marks'][canvas]
+    i = marks.index(mark)
+    for j in range(i - 1, -1, -1):
+        if marks[j].mounted:
+            canvas.insert(canvas.indexof(marks[j].group) + 1, mark.group)
+            break
+    else:
+        for j in range(i + 1, len(marks)):
+            if marks[j].mounted:
+                canvas.insert(canvas.indexof(marks[j].group), mark.group)
+                break
+        else:
+            canvas.add(mark.group)
+    mark.mounted = True
+
+
+def _mark_unmount(canvas, mark):
+    if not mark.mounted:
+        return
+    try:
+        canvas.remove(mark.group)
+    except Exception:
+        pass
+    mark.mounted = False
+
+
+class IfNode(_ControlNode):
+    '''An ``if`` / ``elif`` / ``else`` chain: mounts the active branch's
+    children, host properties, handlers and canvas; tears them down when the
+    branch leaves.'''
+
+    def __init__(self, *largs, **kwargs):
+        super(IfNode, self).__init__(*largs, **kwargs)
+        self.active_index = -1
+        self.items = []
+        self._prop_captured = {}
+        self._handler_uids = []
+        self._canvas_groups = {}
+        self._canvas_captured = []
+        self._canvas_subnodes = []
+        self._branch_ids = []
+
+    def iter_items(self):
+        return self.items
+
+    def activate(self, rule_children=None, pos=None):
+        global InstructionGroup
+        host = self.host
+        for index, branch in enumerate(self.ctl.branches):
+            for attr in _canvas_attrs:
+                if getattr(branch, attr) is None:
+                    continue
+                if InstructionGroup is None:
+                    from kivy.graphics import InstructionGroup
+                mark = _CanvasMark(InstructionGroup())
+                _mark_register(host, self._canvas_for(attr), mark)
+                self._canvas_groups[(index, attr)] = mark
+        self._bind_expr(self.ctl.selector_prop)
+        self._active = True
+        self.active_index = -1
+        self._mount(rule_children, pos)
+
+    def _canvas_for(self, attr):
+        host = self.host
+        return (host.canvas if attr == 'canvas_root' else
+                host.canvas.before if attr == 'canvas_before' else
+                host.canvas.after)
+
+    def _run_update(self):
+        index = self.value
+        index = -1 if index is None else int(index)
+        if index == self.active_index:
+            return
+        self._unmount()
+        self._mount(None, None)
+
+    def _mount(self, rule_children, pos):
+        index = self.value
+        index = -1 if index is None else int(index)
+        self.active_index = index
+        branches = self.ctl.branches
+        if index < 0 or index >= len(branches):
+            return
+        branch = branches[index]
+        builder = self.builder
+        host = self.host
+        if pos is None:
+            pos = self._position()
+        built = rule_children if rule_children is not None else []
+        log = builder._scope_id_log
+        n = len(log)
+        self.items = builder._build_items(
+            host, branch.children, self.idmap, pos, built, self.for_scope)
+        self._branch_ids = log[n:]
+        del log[n:]
+        self._mount_props(branch)
+        self._mount_handlers(branch)
+        self._mount_canvas(index, branch)
+        self._dispatch_kv_post(rule_children, built)
+
+    def _mount_props(self, branch):
+        if not branch.properties:
+            return
+        host = self.host
+        target = self.for_scope if self.for_scope is not None else host
+        if target is host:
+            branch.create_missing(host)
+        self_ref = host.proxy_ref if target is not host else None
+        for name, prop in branch.properties.items():
+            co = prop.co_value
+            if type(co) is CodeType:
+                blist = _handlers[target.uid][name]
+                n = len(blist)
+                value, _ = create_handler(
+                    target, target, name, co, prop, self.idmap,
+                    self_ref=self_ref)
+                self._prop_captured[name] = blist[n:]
+            else:
+                value = co
+            setattr(target, name, value)
+
+    def _mount_handlers(self, branch):
+        host = self.host
+        for crule in branch.handlers:
+            key = crule.name
+            if not host.is_event_type(key):
+                key = key[3:]
+            idmap = copy(global_idmap)
+            idmap.update(self.idmap)
+            idmap['self'] = host.proxy_ref
+            uid = host.fbind(key, custom_callback, crule, idmap)
+            if not uid:
+                raise BuilderException(
+                    crule.ctx, crule.line,
+                    'AttributeError: %s' % crule.name)
+            self._handler_uids.append((key, uid))
+            if crule.name == 'on_parent':
+                Factory.Widget.parent.dispatch(host.__self__)
+
+    def _mount_canvas(self, index, branch):
+        builder = self.builder
+        for attr in _canvas_attrs:
+            crule = getattr(branch, attr)
+            if crule is None:
+                continue
+            mark = self._canvas_groups[(index, attr)]
+            _mark_mount(self.host, self._canvas_for(attr), mark)
+            builder._build_canvas_content(
+                mark.group, self.host, crule, self.idmap,
+                self._canvas_captured, self._canvas_subnodes)
+
+    def _unmount(self):
+        host = self.host
+        builder = self.builder
+        for scope, name, widget in self._branch_ids:
+            try:
+                if getattr(scope, name) == widget:
+                    setattr(scope, name, None)
+            except ReferenceError:
+                pass
+        self._branch_ids = []
+        builder._teardown_items(host, self.items)
+        self.items = []
+        target = self.for_scope if self.for_scope is not None else host
+        for name, captured in self._prop_captured.items():
+            _unbind_captured(target.uid, name, captured)
+        self._prop_captured = {}
+        for key, uid in self._handler_uids:
+            try:
+                host.unbind_uid(key, uid)
+            except ReferenceError:
+                pass
+        self._handler_uids = []
+        for node in self._canvas_subnodes:
+            node.teardown()
+        self._canvas_subnodes = []
+        for key, captured in self._canvas_captured:
+            _unbind_captured(host.uid, key, captured)
+        self._canvas_captured = []
+        index = self.active_index
+        for (branch_index, attr), mark in self._canvas_groups.items():
+            if branch_index == index:
+                mark.group.clear()
+                _mark_unmount(self._canvas_for(attr), mark)
+        self.active_index = -1
+
+    def teardown(self):
+        self._unmount()
+        marks = self.host.__dict__.get('_kv_canvas_marks') or {}
+        for (branch_index, attr), mark in self._canvas_groups.items():
+            _mark_unmount(self._canvas_for(attr), mark)
+            registry = marks.get(self._canvas_for(attr))
+            if registry and mark in registry:
+                registry.remove(mark)
+        self._canvas_groups = {}
+        super(IfNode, self).teardown()
+
+
+class _CanvasNode(_ControlNode):
+    '''Base for canvas control nodes: owns one InstructionGroup slotted at
+    the block's position in the enclosing canvas (or group).'''
+
+    def __init__(self, builder, host, ctl, idmap, group, **kwargs):
+        super(_CanvasNode, self).__init__(builder, host, ctl, idmap, **kwargs)
+        self.group = group
+        self._captured = []
+        self._subnodes = []
+
+    def _clear_content(self):
+        for node in self._subnodes:
+            node.teardown()
+        self._subnodes = []
+        for key, captured in self._captured:
+            _unbind_captured(self.host.uid, key, captured)
+        self._captured = []
+        self.group.clear()
+
+    def teardown(self):
+        self._clear_content()
+        super(_CanvasNode, self).teardown()
+
+
+class CanvasIfNode(_CanvasNode):
+
+    def __init__(self, *largs, **kwargs):
+        super(CanvasIfNode, self).__init__(*largs, **kwargs)
+        self.active_index = -1
+
+    def activate(self, rule_children=None, pos=None):
+        self._bind_expr(self.ctl.selector_prop)
+        self._active = True
+        self._mount()
+
+    def _run_update(self):
+        index = self.value
+        index = -1 if index is None else int(index)
+        if index == self.active_index:
+            return
+        self._clear_content()
+        self._mount()
+
+    def _mount(self):
+        index = self.value
+        index = -1 if index is None else int(index)
+        self.active_index = index
+        branches = self.ctl.branches
+        if index < 0 or index >= len(branches):
+            return
+        self.builder._build_canvas_content(
+            self.group, self.host, branches[index], self.idmap,
+            self._captured, self._subnodes)
+
+
 class BuilderBase(object):
     '''The Builder is responsible for creating a :class:`Parser` for parsing a
     kv file, merging the results into its internal rules, dynamic classes,
@@ -278,6 +729,49 @@ class BuilderBase(object):
         self.dynamic_classes = {}
         self.rules = []
         self.rulectx = {}
+        # control statements runtime state
+        self._apply_depth = 0
+        self._processing = False
+        self._pending = []
+        self._node_queue = []
+        self._scope_id_log = []
+        # rule_children lists awaiting their on_kv_post dispatch: a widget
+        # destroyed while one is pending is scrubbed from it, so the event
+        # never fires on a widget a control statement already tore down
+        self._rc_stack = []
+
+    def _end_apply(self, failed=False):
+        # closes one apply level; at the outermost level, either run the
+        # deferred control-statement work or (on failure) drop it
+        self._apply_depth -= 1
+        if self._apply_depth == 0:
+            if failed:
+                del self._pending[:]
+                del self._node_queue[:]
+            elif not self._processing:
+                self._process_queues()
+
+    def _process_queues(self):
+        '''Run deferred control-statement builds and queued node updates
+        until both queues drain. Content built here may enqueue more work
+        (nested rules, reactive handlers); an update firing while another
+        apply or rebuild is in flight lands in these queues instead of
+        re-entering it.'''
+        if self._processing:
+            return
+        self._processing = True
+        try:
+            while self._pending or self._node_queue:
+                if self._pending:
+                    self._pending.pop(0)()
+                else:
+                    self._node_queue.pop(0)._run_update()
+        except BaseException:
+            del self._pending[:]
+            del self._node_queue[:]
+            raise
+        finally:
+            self._processing = False
 
     @classmethod
     def create_from(cls, builder):
@@ -403,11 +897,22 @@ class BuilderBase(object):
             if parser.root:
                 widget = Factory.get(parser.root.name)(__no_builder=True)
                 rule_children = []
-                widget.apply_class_lang_rules(
-                    root=widget, rule_children=rule_children)
-                self._apply_rule(
-                    widget, parser.root, parser.root,
-                    rule_children=rule_children)
+                # one apply level for the whole root build, so deferred
+                # control-statement work (branches, slots) runs only once
+                # every rule -- class and root -- has been applied
+                self._apply_depth += 1
+                self._rc_stack.append(rule_children)
+                failed = True
+                try:
+                    widget.apply_class_lang_rules(
+                        root=widget, rule_children=rule_children)
+                    self._apply_rule(
+                        widget, parser.root, parser.root,
+                        rule_children=rule_children)
+                    failed = False
+                finally:
+                    self._end_apply(failed=failed)
+                    self._rc_stack.pop()
 
                 for child in rule_children:
                     child.dispatch('on_kv_post', widget)
@@ -459,10 +964,20 @@ class BuilderBase(object):
 
         if dispatch_kv_post:
             rule_children = rule_children if rule_children is not None else []
-        for rule in rules:
-            self._apply_rule(
-                widget, rule, rule, ignored_consts=ignored_consts,
-                rule_children=rule_children)
+        self._apply_depth += 1
+        if rule_children is not None:
+            self._rc_stack.append(rule_children)
+        failed = True
+        try:
+            for rule in rules:
+                self._apply_rule(
+                    widget, rule, rule, ignored_consts=ignored_consts,
+                    rule_children=rule_children)
+            failed = False
+        finally:
+            self._end_apply(failed=failed)
+            if rule_children is not None:
+                self._rc_stack.pop()
         if dispatch_kv_post:
             for w in rule_children:
                 w.dispatch('on_kv_post', widget)
@@ -506,10 +1021,20 @@ class BuilderBase(object):
 
         if dispatch_kv_post:
             rule_children = rule_children if rule_children is not None else []
-        for rule in rules:
-            self._apply_rule(
-                widget, rule, rule, ignored_consts=ignored_consts,
-                rule_children=rule_children)
+        self._apply_depth += 1
+        if rule_children is not None:
+            self._rc_stack.append(rule_children)
+        failed = True
+        try:
+            for rule in rules:
+                self._apply_rule(
+                    widget, rule, rule, ignored_consts=ignored_consts,
+                    rule_children=rule_children)
+            failed = False
+        finally:
+            self._end_apply(failed=failed)
+            if rule_children is not None:
+                self._rc_stack.pop()
         if dispatch_kv_post:
             for w in rule_children:
                 w.dispatch('on_kv_post', widget)
@@ -519,20 +1044,46 @@ class BuilderBase(object):
         self._match_name_cache.clear()
 
     def _apply_rule(self, widget, rule, rootrule,
-                    ignored_consts=set(), rule_children=None):
+                    ignored_consts=set(), rule_children=None, ids=None):
         # widget: the current instantiated widget
         # rule: the current rule
         # rootrule: the current root rule (for children of a rule)
+        # ids: pre-seeded ids context (used when control statements rebuild
+        #      content outside the original rule application)
 
         # will collect reference to all the id in children
         assert rule not in self.rulectx
-        self.rulectx[rule] = rctx = {
-            'ids': {'root': widget.proxy_ref},
+        self.rulectx[rule] = {
+            'ids': ids if ids is not None else {'root': widget.proxy_ref},
             'set': [], 'hdl': []}
 
         # extract the context of the rootrule (not rule!)
         assert rootrule in self.rulectx
         rctx = self.rulectx[rootrule]
+
+        self._apply_depth += 1
+        failed = True
+        try:
+            self._apply_rule_body(
+                widget, rule, rootrule, rctx, ignored_consts, rule_children)
+            failed = False
+        except Exception:
+            self.rulectx.pop(rule, None)
+            raise
+        finally:
+            self._end_apply(failed=failed)
+
+    def _apply_rule_body(self, widget, rule, rootrule, rctx,
+                         ignored_consts, rule_children):
+        if rootrule is rule:
+            # re-applying a rule to a widget resets its control nodes
+            if widget.__dict__.get('_kv_control_nodes'):
+                self._reset_control_state(widget, rule)
+            # rule-level reactive-id scope (ids in `if`/`slot` blocks)
+            if rule.id_scope_key is not None:
+                scope = _make_scope(rule.id_scope_names)
+                rctx['ids'][rule.id_scope_key] = scope
+                widget.__dict__.setdefault('_kv_id_scopes', []).append(scope)
 
         # if we got an id, put it in the root rule for a later global usage
         if rule.id:
@@ -547,6 +1098,9 @@ class BuilderBase(object):
             for _key, _value in _ids.items():
                 if _value == _root:
                     # skip on self
+                    continue
+                if _key.startswith('__kvscope'):
+                    # hidden scope objects are not ids
                     continue
                 _new_ids[_key] = _value
             _root.ids = _new_ids
@@ -569,26 +1123,49 @@ class BuilderBase(object):
                 self._build_canvas(widget.canvas.after, widget,
                                    rule.canvas_after, rootrule)
 
-        # create children tree
+        # create children tree. Rules using control statements (or applied
+        # to a widget with slots or tracked entries) additionally maintain
+        # the entry structure nodes use to track their spans; a control-free
+        # rule on a plain widget only pays the two boolean tests.
         Factory_get = Factory.get
+        entries = widget.__dict__.get('_kv_entries')
+        tracked = rule.has_controls or entries is not None
+        if tracked:
+            if entries is None:
+                entries = widget._kv_entries = list(
+                    reversed(widget.children))
+            nodes = widget.__dict__.get('_kv_control_nodes')
+            if nodes is None:
+                nodes = widget._kv_control_nodes = []
+        ids = rctx['ids']
         for crule in rule.children:
-            cname = crule.name
+            if tracked and isinstance(crule, ParserControlRule):
+                node = self._make_control_node(widget, crule, ids, None)
+                node.owner_rule = rootrule
+                entries.append(node)
+                nodes.append(node)
+                self._pending.append(partial(node.activate, rule_children))
+                continue
 
+            cname = crule.name
             if cname in ('canvas', 'canvas.before', 'canvas.after'):
                 raise ParserException(
                     crule.ctx, crule.line,
                     'Canvas instructions added in kv must '
                     'be declared before child widgets.')
-
             cls = Factory_get(cname)
 
-            # we can't construct it without __no_builder=True, because the
-            # previous implementation was doing the add_widget() before
-            # apply(), and so, we could use "self.parent".
+            # we can't construct it without __no_builder=True, because
+            # the previous implementation was doing the add_widget()
+            # before apply(), and so, we could use "self.parent".
             child = cls(__no_builder=True)
             widget.add_widget(child)
+            if tracked:
+                entries.append(child)
+            if crule.scope_id is not None:
+                self._assign_scope_id(ids, crule.scope_id, child)
             child.apply_class_lang_rules(
-                root=rctx['ids']['root'], rule_children=rule_children)
+                root=ids['root'], rule_children=rule_children)
             self._apply_rule(
                 child, crule, rootrule, rule_children=rule_children)
 
@@ -606,8 +1183,8 @@ class BuilderBase(object):
         if rule.handlers:
             rctx['hdl'].append((widget.proxy_ref, rule.handlers))
 
-        # if we are applying another rule that the root one, then it's done for
-        # us!
+        # if we are applying another rule that the root one, then it's done
+        # for us!
         if rootrule is not rule:
             del self.rulectx[rule]
             return
@@ -670,6 +1247,140 @@ class BuilderBase(object):
 
         # rule finished, forget it
         del self.rulectx[rootrule]
+
+    #
+    # Control statements runtime support
+    #
+
+    def _assign_scope_id(self, ids, scope_id, widget):
+        scope_key, name = scope_id
+        scope = ids.get(scope_key)
+        if scope is not None:
+            setattr(scope, name, widget)
+            self._scope_id_log.append((scope, name, widget))
+
+    def _make_control_node(self, widget, ctl, ids, for_scope):
+        kind = ctl.kind
+        return IfNode(self, widget, ctl, ids, for_scope=for_scope)
+
+    def _build_items(self, host, crules, ids, pos, rule_children, for_scope):
+        '''Build the entries `crules` (widgets and nested control statements)
+        as children of `host`, starting at document position `pos`, with the
+        ids context `ids`. Returns the item list.'''
+        items = []
+        cursor = pos
+        for crule in crules:
+            if isinstance(crule, ParserControlRule):
+                node = self._make_control_node(host, crule, ids, for_scope)
+                items.append(node)
+                node.activate(rule_children, cursor)
+                cursor += node.count()
+            else:
+                child = self._build_child(
+                    host, crule, ids, cursor, rule_children)
+                items.append(child)
+                cursor += 1
+        return items
+
+    def _build_child(self, host, crule, ids, cursor, rule_children):
+        cls = Factory.get(crule.name)
+        child = cls(__no_builder=True)
+        children = host.children
+        index = max(0, min(len(children), len(children) - cursor))
+        host.add_widget(child, index=index)
+        if crule.scope_id is not None:
+            self._assign_scope_id(ids, crule.scope_id, child)
+        child.apply_class_lang_rules(
+            root=ids.get('root'), rule_children=rule_children)
+        self._apply_rule(
+            child, crule, crule, rule_children=rule_children, ids=dict(ids))
+        if rule_children is not None:
+            rule_children.append(child)
+        return child
+
+    def _teardown_items(self, host, items):
+        for it in items:
+            if isinstance(it, _ControlNode):
+                it.teardown()
+            else:
+                self._destroy_widget(host, it)
+
+    def _destroy_widget(self, host, widget):
+        for sub in widget.walk(restrict=True):
+            self.unbind_widget(sub.uid)
+            for sink in self._rc_stack:
+                try:
+                    sink.remove(sub)
+                except ValueError:
+                    pass
+        if widget.parent is host:
+            host.remove_widget(widget)
+
+    def _reset_control_state(self, widget, rule):
+        '''Re-applying a rule to a widget tears down the control nodes that
+        rule created before, so they are not duplicated.'''
+        nodes = widget.__dict__.get('_kv_control_nodes')
+        entries = widget.__dict__.get('_kv_entries')
+        stale = []
+        if nodes:
+            stale += [n for n in nodes if n.owner_rule is rule]
+        for node in stale:
+            node.teardown()
+            if nodes and node in nodes:
+                nodes.remove(node)
+            if entries and node in entries:
+                entries.remove(node)
+        scopes = widget.__dict__.get('_kv_id_scopes')
+        if scopes:
+            del scopes[:]
+
+    def _build_canvas_content(self, group, widget, rule, ids, captured,
+                              subnodes):
+        '''Build the canvas rule `rule`'s children into `group` (explicit
+        adds: no canvas context is active here), recording created bindings
+        in `captured` and nested control nodes in `subnodes`.'''
+        global Instruction, InstructionGroup
+        if Instruction is None:
+            Instruction = Factory.get('Instruction')
+        for crule in rule.children:
+            if isinstance(crule, ParserControlRule):
+                if InstructionGroup is None:
+                    from kivy.graphics import InstructionGroup
+                sub = InstructionGroup()
+                group.add(sub)
+                node = CanvasIfNode(self, widget, crule, ids, sub)
+                subnodes.append(node)
+                node.activate()
+                continue
+            if crule.name == 'Clear':
+                group.clear()
+                continue
+            instr = Factory.get(crule.name)()
+            if not isinstance(instr, Instruction):
+                raise BuilderException(
+                    crule.ctx, crule.line,
+                    'You can add only graphics Instruction in canvas.')
+            group.add(instr)
+            try:
+                for prule in crule.properties.values():
+                    key = prule.name
+                    value = prule.co_value
+                    if type(value) is CodeType:
+                        blist = _handlers[widget.uid][key]
+                        n = len(blist)
+                        value, _ = create_handler(
+                            widget, instr.proxy_ref, key, value, prule,
+                            ids, True)
+                        if len(blist) > n:
+                            captured.append((key, blist[n:]))
+                    setattr(instr, key, value)
+            except BuilderException:
+                raise
+            except Exception as e:
+                tb = sys.exc_info()[2]
+                raise BuilderException(
+                    prule.ctx, prule.line,
+                    '{}: {}'.format(e.__class__.__name__, e), cause=tb)
 
     def match(self, widget):
         '''Return a list of :class:`ParserRule` objects matching the widget.
@@ -830,11 +1541,24 @@ class BuilderBase(object):
             del _handlers[uid]
 
     def _build_canvas(self, canvas, widget, rule, rootrule):
-        global Instruction
+        global Instruction, InstructionGroup
         if Instruction is None:
             Instruction = Factory.get('Instruction')
         idmap = copy(self.rulectx[rootrule]['ids'])
         for crule in rule.children:
+            if isinstance(crule, ParserControlRule):
+                # created inside the canvas `with` block, so the group is
+                # auto-added at the block's document position; the content is
+                # built in the deferred phase, outside the canvas context
+                if InstructionGroup is None:
+                    from kivy.graphics import InstructionGroup
+                group = InstructionGroup()
+                node = CanvasIfNode(self, widget, crule, idmap, group)
+                node.owner_rule = rootrule
+                widget.__dict__.setdefault(
+                    '_kv_control_nodes', []).append(node)
+                self._pending.append(partial(node.activate, None))
+                continue
             name = crule.name
             if name == 'Clear':
                 canvas.clear()
@@ -875,6 +1599,13 @@ if 'KIVY_PROFILE_LANG' in environ:
             if prp.line != index:
                 continue
             yield prp
+        if isinstance(rule, ParserControlRule):
+            if (rule.selector_prop is not None and
+                    rule.selector_prop.line == index):
+                yield rule.selector_prop
+            for branch in rule.branches:
+                for r in match_rule(fn, index, branch):
+                    yield r
         for child in rule.children:
             for r in match_rule(fn, index, child):
                 yield r
