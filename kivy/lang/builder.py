@@ -805,6 +805,79 @@ class ForNode(_ControlNode):
         super(ForNode, self).teardown()
 
 
+class FactoryNode(_ControlNode):
+    '''A ``factory <expr>`` block: one child whose class comes from an
+    expression, rebuilt when the class changes; the block body is applied to
+    the instance as an ordinary rule.'''
+
+    def __init__(self, *largs, **kwargs):
+        super(FactoryNode, self).__init__(*largs, **kwargs)
+        self.items = []
+
+    def iter_items(self):
+        return self.items
+
+    def activate(self, rule_children=None, pos=None):
+        self._bind_expr(self.ctl.class_prop)
+        self._active = True
+        self._build(rule_children, pos)
+
+    def _run_update(self):
+        # resolve first: two expressions naming the same class (an alias, a
+        # string vs the class object) must not rebuild the widget
+        cls = self._resolve_class()
+        if self.items and type(self.items[0]) is cls:
+            return
+        self.builder._teardown_items(self.host, self.items)
+        self.items = []
+        self._build_resolved(cls, None, None)
+
+    def _resolve_class(self):
+        value = self.value
+        if value is None or not isinstance(value, str):
+            return value
+        try:
+            return Factory.get(value)
+        except Exception as e:
+            tb = sys.exc_info()[2]
+            raise BuilderException(
+                self.ctl.ctx, self.ctl.line,
+                '{}: {}'.format(e.__class__.__name__, e), cause=tb)
+
+    def _build(self, rule_children, pos):
+        self._build_resolved(self._resolve_class(), rule_children, pos)
+
+    def _build_resolved(self, cls, rule_children, pos):
+        if cls is None:
+            return
+        ctl = self.ctl
+        builder = self.builder
+        host = self.host
+        if pos is None:
+            pos = self._position()
+        try:
+            widget = cls(__no_builder=True)
+        except Exception as e:
+            tb = sys.exc_info()[2]
+            raise BuilderException(
+                ctl.ctx, ctl.line,
+                '{}: {}'.format(e.__class__.__name__, e), cause=tb)
+        host.add_widget(widget, index=self._insert_index(pos))
+        built = rule_children if rule_children is not None else []
+        widget.apply_class_lang_rules(
+            root=self.idmap.get('root'), rule_children=built)
+        builder._apply_rule(
+            widget, ctl, ctl, rule_children=built, ids=dict(self.idmap))
+        built.append(widget)
+        self.items = [widget]
+        self._dispatch_kv_post(rule_children, built)
+
+    def teardown(self):
+        self.builder._teardown_items(self.host, self.items)
+        self.items = []
+        super(FactoryNode, self).teardown()
+
+
 class _CanvasNode(_ControlNode):
     '''Base for canvas control nodes: owns one InstructionGroup slotted at
     the block's position in the enclosing canvas (or group).'''
@@ -1543,7 +1616,9 @@ class BuilderBase(object):
         kind = ctl.kind
         if kind == 'if':
             return IfNode(self, widget, ctl, ids, for_scope=for_scope)
-        return ForNode(self, widget, ctl, ids)
+        if kind == 'for':
+            return ForNode(self, widget, ctl, ids)
+        return FactoryNode(self, widget, ctl, ids)
 
     def _build_items(self, host, crules, ids, pos, rule_children, for_scope):
         '''Build the entries `crules` (widgets and nested control statements)
@@ -1887,7 +1962,7 @@ if 'KIVY_PROFILE_LANG' in environ:
             yield prp
         if isinstance(rule, ParserControlRule):
             for prp in (rule.selector_prop, rule.iterator_prop,
-                        rule.key_prop):
+                        rule.key_prop, rule.class_prop):
                 if prp is not None and prp.line == index:
                     yield prp
             for _, prp in rule.locals:

@@ -1,5 +1,5 @@
 '''
-Tests for parsing kv control statements (if/elif/else, for).
+Tests for parsing kv control statements (if/elif/else, for, factory).
 
 These only cover the parser stage (:class:`kivy.lang.parser.Parser`);
 builder/runtime behavior is tested separately.
@@ -435,6 +435,14 @@ if True:
         self.assertEqual(ctl.children[0].scope_id, (ctl.scope_key, 'lab'))
         self.assertIn(ctl.scope_key, ctl.children[1].properties['text'].value)
 
+    def test_id_inside_factory_body_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    factory 'Label':
+        Label:
+            id: nope
+''', '"id" is not allowed')
+
     def test_id_deep_inside_if_is_collected(self):
         rule = parse_rule('''
 <W@Widget>:
@@ -595,6 +603,47 @@ if True:
     async for x in self.items:
         Label:
 ''', '')
+
+    def test_factory_parses_class_expression_and_body(self):
+        rule = parse_rule('''
+<W@Widget>:
+    which: 'Button'
+    factory self.which:
+        text: root.caption
+        Label:
+            text: 'inner'
+''')
+        self.assertTrue(rule.has_controls)
+        ctl = rule.children[-1]
+        self.assertIsInstance(ctl, ParserControlRule)
+        self.assertEqual(ctl.kind, 'factory')
+        self.assertEqual(ctl.class_prop.value, 'self.which')
+        self.assertIn(['self', 'which'], ctl.class_prop.watched_keys)
+        # the body is a full widget rule applied to the instance
+        self.assertIn('text', ctl.properties)
+        self.assertEqual(len(ctl.children), 1)
+
+    def test_factory_requires_expression(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    factory:
+        Label:
+''', '"factory" requires an expression')
+
+    def test_factory_in_canvas_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    canvas:
+        factory self.which:
+            Color:
+''', 'cannot be declared inside canvas')
+
+    def test_factory_walrus_forbidden(self):
+        self.assert_parse_error('''
+<W@Widget>:
+    factory (x := self.which):
+        Label:
+''', 'assignment expressions')
 
 
 if __name__ == '__main__':

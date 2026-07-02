@@ -1,5 +1,5 @@
 '''
-Runtime tests for kv control statements (if/elif/else, for).
+Runtime tests for kv control statements (if/elif/else, for, factory).
 
 These cover the builder stage; pure parsing is tested in
 ``test_lang_parser_control.py``.
@@ -924,6 +924,167 @@ BoxLayout:
             self.assertIn('not iterable', str(cm.exception))
         finally:
             Builder.unload_file('anyitems.kv')
+
+
+class FactoryRuntimeTestCase(unittest.TestCase):
+    '''``factory expr:`` builds a single child widget whose class comes from
+    an expression (a class object or a Factory name), rebuilt reactively when
+    the class changes; the block body is applied to the instance.'''
+
+    def test_build_by_name_and_rebuild_on_change(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynByName@BoxLayout>:
+    which: 'Button'
+    caption: 'hi'
+    factory self.which:
+        text: root.caption
+''', filename='dyn_name.kv')
+        try:
+            w = Factory.DynByName()
+            self.assertEqual(type(w.children[0]).__name__, 'Button')
+            self.assertEqual(w.children[0].text, 'hi')
+            # changing the class rebuilds with the new type, body re-applied
+            w.which = 'Label'
+            self.assertEqual(type(w.children[0]).__name__, 'Label')
+            self.assertEqual(w.children[0].text, 'hi')
+        finally:
+            Builder.unload_file('dyn_name.kv')
+
+    def test_class_object_value(self):
+        from kivy.factory import Factory
+        from kivy.uix.label import Label
+        Builder.load_string('''
+<DynByCls@BoxLayout>:
+    klass: None
+    factory self.klass:
+        text: 'z'
+''', filename='dyn_cls.kv')
+        try:
+            w = Factory.DynByCls()
+            self.assertEqual(len(w.children), 0)   # None -> nothing
+            w.klass = Label
+            self.assertEqual(type(w.children[0]).__name__, 'Label')
+            self.assertEqual(w.children[0].text, 'z')
+        finally:
+            Builder.unload_file('dyn_cls.kv')
+
+    def test_body_property_reactive_and_identity_stable(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynBody@BoxLayout>:
+    caption: 'a'
+    factory 'Label':
+        text: root.caption
+''', filename='dyn_body.kv')
+        try:
+            w = Factory.DynBody()
+            child = w.children[0]
+            self.assertEqual(child.text, 'a')
+            # body prop is reactive; the widget is NOT rebuilt (class same)
+            w.caption = 'b'
+            self.assertEqual(child.text, 'b')
+            self.assertIs(w.children[0], child)
+        finally:
+            Builder.unload_file('dyn_body.kv')
+
+    def test_factory_inside_for(self):
+        from kivy.factory import Factory
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        Builder.load_string('''
+<DynForm@BoxLayout>:
+    rows: []
+    for row in self.rows:
+        factory row['cls']:
+            text: row['text']
+''', filename='dyn_form.kv')
+        try:
+            w = Factory.DynForm()
+            w.rows = [{'cls': Label, 'text': 'a'},
+                      {'cls': Button, 'text': 'b'}]
+            kids = list(reversed(w.children))
+            self.assertEqual(
+                [(type(k).__name__, k.text) for k in kids],
+                [('Label', 'a'), ('Button', 'b')])
+        finally:
+            Builder.unload_file('dyn_form.kv')
+
+    def test_factory_with_children(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynPanel@BoxLayout>:
+    factory 'BoxLayout':
+        orientation: 'vertical'
+        Label:
+            text: 'a'
+        Label:
+            text: 'b'
+''', filename='dyn_panel.kv')
+        try:
+            w = Factory.DynPanel()
+            inner = w.children[0]
+            self.assertEqual(inner.orientation, 'vertical')
+            self.assertEqual(texts(inner), ['a', 'b'])
+        finally:
+            Builder.unload_file('dyn_panel.kv')
+
+    def test_factory_keeps_document_position(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynPos@BoxLayout>:
+    which: 'Label'
+    Label:
+        text: 'before'
+    factory self.which:
+        text: 'mid'
+    Label:
+        text: 'after'
+''', filename='dyn_pos.kv')
+        try:
+            w = Factory.DynPos()
+            self.assertEqual(texts(w), ['before', 'mid', 'after'])
+            w.which = 'Button'
+            self.assertEqual(texts(w), ['before', 'mid', 'after'])
+            self.assertEqual(type(by_text(w)['mid']).__name__, 'Button')
+        finally:
+            Builder.unload_file('dyn_pos.kv')
+
+    def test_factory_widget_is_collected(self):
+        import gc
+        import weakref
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynGc@BoxLayout>:
+    which: 'Label'
+    factory self.which:
+        text: 'x'
+''', filename='dyn_gc.kv')
+        try:
+            w = Factory.DynGc()
+            w.which = 'Button'
+            ref = weakref.ref(w)
+            del w
+            gc.collect()
+            self.assertIsNone(ref())
+        finally:
+            Builder.unload_file('dyn_gc.kv')
+
+    def test_factory_unknown_class_raises_with_context(self):
+        from kivy.factory import Factory
+        Builder.load_string('''
+<DynBad@BoxLayout>:
+    which: 'Label'
+    factory self.which:
+        text: 'x'
+''', filename='dyn_bad.kv')
+        try:
+            w = Factory.DynBad()
+            with self.assertRaises(BuilderException) as cm:
+                w.which = 'NoSuchWidgetClass'
+            self.assertIn('NoSuchWidgetClass', str(cm.exception))
+        finally:
+            Builder.unload_file('dyn_bad.kv')
 
 
 class ControlIdRuntimeTestCase(unittest.TestCase):

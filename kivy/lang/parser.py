@@ -50,7 +50,7 @@ lang_key = re.compile('([a-zA-Z_]+)')
 lang_keyvalue = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]+)')
 lang_tr = re.compile(r'(_\()')
 lang_cls_split_pat = re.compile(', *')
-lang_control = re.compile(r'(if|elif|else|for)\b')
+lang_control = re.compile(r'(if|elif|else|for|factory)\b')
 
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
@@ -467,14 +467,14 @@ class ParserControlBranch(ParserRule):
 
 
 class ParserControlRule(ParserRule):
-    '''A control statement (``if`` chain or ``for``)
+    '''A control statement (``if`` chain, ``for`` or ``factory``)
     at child position in a rule. The body is parsed with the ordinary rule
     machinery; :class:`Parser` finalizes it (chain merging, scope resolution,
     reference rewriting) before precompilation.
     '''
 
     __slots__ = ('kind', 'branches', 'selector_prop', 'iterator_prop',
-                 'key_prop', 'target_names',
+                 'key_prop', 'class_prop', 'target_names',
                  'locals', 'scope_key', 'scope_names', 'in_canvas',
                  'header_src')
 
@@ -492,6 +492,8 @@ class ParserControlRule(ParserRule):
         self.iterator_prop = None
         #: for: per-iteration key expression (evaluated during reconcile)
         self.key_prop = None
+        #: factory: the class expression
+        self.class_prop = None
         #: for: loop target names, in order
         self.target_names = []
         #: for: [(name, ParserRuleProperty)] iteration-locals, in order
@@ -508,8 +510,8 @@ class ParserControlRule(ParserRule):
         super(ParserControlRule, self).precompile()
         for branch in self.branches:
             branch.precompile()
-        for prop in (self.selector_prop, self.iterator_prop,
-                     self.key_prop):
+        for prop in (self.selector_prop, self.iterator_prop, self.key_prop,
+                     self.class_prop):
             if prop is not None:
                 prop.precompile()
         for _, prop in self.locals:
@@ -955,8 +957,16 @@ class Parser(object):
             if expr:
                 raise ParserException(self, ln, '"else" takes no expression')
             ctl.header_src = None
-        else:  # for
+        elif kind == 'for':
             self._parse_for_header(ln, ctl, head)
+        else:  # factory
+            if not expr:
+                raise ParserException(
+                    self, ln, '"factory" requires an expression giving the '
+                    'widget class')
+            self._check_header_expr(ln, expr)
+            ctl.class_prop = ParserRuleProperty(
+                self, ln, '__kv_factory_class', expr)
         return ctl
 
     def _split_control_header(self, ln, content):
@@ -1192,6 +1202,9 @@ class Parser(object):
                 if child.kind == 'if':
                     for branch in child.branches:
                         self._collect_scoped_ids(branch, found)
+                elif child.kind == 'factory':
+                    self._forbid_ids(child)
+                # 'for': its ids live on the iteration scope
             else:
                 if child.id:
                     statics.append(self._clean_id(child.id, child))
@@ -1203,10 +1216,20 @@ class Parser(object):
                 if child.kind == 'if':
                     for branch in child.branches:
                         self._collect_scoped_ids(branch, found)
+                elif child.kind == 'factory':
+                    self._forbid_ids(child)
             else:
                 if child.id:
                     found.append((self._clean_id(child.id, child), child))
                 self._collect_scoped_ids(child, found)
+
+    def _forbid_ids(self, rule):
+        for child in rule.children:
+            if not isinstance(child, ParserControlRule) and child.id:
+                raise ParserException(
+                    self, child.line, '"id" is not allowed on widgets inside '
+                    'a "factory" block')
+            self._forbid_ids(child)
 
     #
     # Control statements: validation, scopes and reference rewriting
@@ -1249,6 +1272,14 @@ class Parser(object):
                 self._walk_branch(branch, env, for_ctl)
         elif kind == 'for':
             self._walk_for(ctl, env)
+        else:  # factory
+            self._rewrite_prop(ctl.class_prop, env)
+            if 'key' in ctl.properties:
+                raise ParserException(
+                    self, ctl.properties['key'].line, '"key:" is only '
+                    'allowed inside a "for" block')
+            # the body is an ordinary rule applied to the built instance
+            self._walk_rule(ctl, env, None)
 
     def _walk_branch(self, branch, env, for_ctl):
         if branch.id:
@@ -1351,6 +1382,8 @@ class Parser(object):
                 if child.kind == 'if':
                     for branch in child.branches:
                         self._collect_for_ids(branch.children, out)
+                elif child.kind == 'factory':
+                    self._forbid_ids(child)
                 # nested 'for': its own scope; 'slot': forbidden in for
             else:
                 if child.id:
@@ -1372,6 +1405,9 @@ class Parser(object):
 
     def _walk_canvas_control(self, ctl, env):
         kind = ctl.kind
+        if kind == 'factory':
+            raise ParserException(
+                self, ctl.line, '"factory" cannot be declared inside canvas')
         if kind == 'if':
             self._rewrite_prop(ctl.selector_prop, env)
             for branch in ctl.branches:
