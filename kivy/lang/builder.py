@@ -340,6 +340,14 @@ def _collect_item_widgets(items, out):
             out.append(it)
 
 
+class _SlotEntry(object):
+    __slots__ = ('node', 'fill')
+
+    def __init__(self):
+        self.node = None
+        self.fill = None
+
+
 class _ControlNode(EventDispatcher):
     '''Base runtime node for a control statement.'''
 
@@ -876,6 +884,96 @@ class FactoryNode(_ControlNode):
         self.builder._teardown_items(self.host, self.items)
         self.items = []
         super(FactoryNode, self).teardown()
+
+
+class SlotNode(_ControlNode):
+    '''A slot definition site: builds the best fill recorded on the host
+    widget, or its own fallback. Slot-scoped locals are exposed to the
+    content through the reserved ``slot`` name.'''
+
+    def __init__(self, *largs, **kwargs):
+        super(SlotNode, self).__init__(*largs, **kwargs)
+        self.items = []
+        self.scope = None
+        self._content_ids = []
+
+    def iter_items(self):
+        return self.items
+
+    def activate(self, rule_children=None, pos=None):
+        self._active = True
+        self._build(rule_children, pos)
+
+    def _build(self, rule_children, pos):
+        builder = self.builder
+        host = self.host
+        ctl = self.ctl
+        slots = host.__dict__.get('_kv_slots') or {}
+        entry = slots.get(ctl.slot_name)
+        fill = entry.fill if entry is not None else None
+        if fill is not None:
+            crules, source_ids, fill_locals = fill
+        else:
+            crules, source_ids, fill_locals = ctl.children, self.idmap, []
+        local_defs = list(ctl.locals)
+        names = []
+        for name, _ in local_defs + list(fill_locals):
+            if name not in names:
+                names.append(name)
+        scope = _make_scope(names) if names else None
+        self.scope = scope
+        host_proxy = host.proxy_ref
+
+        def bind_locals(pairs, base_ids):
+            idmap = dict(base_ids)
+            idmap['slot'] = scope
+            for name, prop in pairs:
+                co = prop.co_value
+                if type(co) is CodeType:
+                    v, _ = create_handler(
+                        scope, scope, name, co, prop, idmap,
+                        self_ref=host_proxy)
+                else:
+                    v = co
+                setattr(scope, name, v)
+
+        if scope is not None:
+            bind_locals(local_defs, self.idmap)
+            if fill_locals:
+                bind_locals(fill_locals, source_ids)
+        content_ids = dict(source_ids)
+        if scope is not None:
+            content_ids['slot'] = scope
+        if pos is None:
+            pos = self._position()
+        built = rule_children if rule_children is not None else []
+        log = builder._scope_id_log
+        n = len(log)
+        self.items = builder._build_items(
+            host, crules, content_ids, pos, built, None)
+        self._content_ids = log[n:]
+        del log[n:]
+        self._dispatch_kv_post(rule_children, built)
+
+    def teardown(self):
+        for scope, name, widget in self._content_ids:
+            try:
+                if getattr(scope, name) == widget:
+                    setattr(scope, name, None)
+            except ReferenceError:
+                pass
+        self._content_ids = []
+        self.builder._teardown_items(self.host, self.items)
+        self.items = []
+        if self.scope is not None:
+            self.builder.unbind_widget(self.scope.uid)
+            self.scope = None
+        slots = self.host.__dict__.get('_kv_slots')
+        if slots is not None:
+            entry = slots.get(self.ctl.slot_name)
+            if entry is not None and entry.node is self:
+                entry.node = None
+        super(SlotNode, self).teardown()
 
 
 class _CanvasNode(_ControlNode):
@@ -1430,7 +1528,8 @@ class BuilderBase(object):
                          ignored_consts, rule_children):
         if rootrule is rule:
             # re-applying a rule to a widget resets its control nodes
-            if widget.__dict__.get('_kv_control_nodes'):
+            if (widget.__dict__.get('_kv_control_nodes') or
+                    widget.__dict__.get('_kv_slots')):
                 self._reset_control_state(widget, rule)
             # rule-level reactive-id scope (ids in `if`/`slot` blocks)
             if rule.id_scope_key is not None:
@@ -1462,6 +1561,15 @@ class BuilderBase(object):
         # the rule if not, they will be created as ObjectProperty.
         rule.create_missing(widget)
 
+        # register the slot names this rule declares, so fills arriving from
+        # later rules (subclasses, the usage site) find their target
+        slots = widget.__dict__.get('_kv_slots')
+        if rule.slot_defs:
+            if slots is None:
+                slots = widget._kv_slots = {}
+            for name in rule.slot_defs:
+                slots.setdefault(name, _SlotEntry())
+
         # build the widget canvas
         if rule.canvas_before:
             with widget.canvas.before:
@@ -1481,8 +1589,11 @@ class BuilderBase(object):
         # the entry structure nodes use to track their spans; a control-free
         # rule on a plain widget only pays the two boolean tests.
         Factory_get = Factory.get
+        route_default = (
+            slots is not None and '' in slots and
+            not (rule.slot_defs and '' in rule.slot_defs))
         entries = widget.__dict__.get('_kv_entries')
-        tracked = rule.has_controls or entries is not None
+        tracked = rule.has_controls or route_default or entries is not None
         if tracked:
             if entries is None:
                 entries = widget._kv_entries = list(
@@ -1490,9 +1601,22 @@ class BuilderBase(object):
             nodes = widget.__dict__.get('_kv_control_nodes')
             if nodes is None:
                 nodes = widget._kv_control_nodes = []
+        routed = []
+        explicit_default = False
         ids = rctx['ids']
         for crule in rule.children:
             if tracked and isinstance(crule, ParserControlRule):
+                if crule.kind == 'slot':
+                    node, is_default_fill = self._register_slot_block(
+                        widget, rule, rootrule, crule, ids, rule_children)
+                    if node is not None:
+                        entries.append(node)
+                    explicit_default = explicit_default or is_default_fill
+                    if explicit_default and routed:
+                        raise BuilderException(
+                            crule.ctx, crule.line, 'cannot mix an explicit '
+                            '"slot:" fill block with plain children')
+                    continue
                 node = self._make_control_node(widget, crule, ids, None)
                 node.owner_rule = rootrule
                 entries.append(node)
@@ -1506,6 +1630,15 @@ class BuilderBase(object):
                     crule.ctx, crule.line,
                     'Canvas instructions added in kv must '
                     'be declared before child widgets.')
+            if route_default:
+                if explicit_default:
+                    raise BuilderException(
+                        crule.ctx, crule.line, 'cannot mix an explicit '
+                        '"slot:" fill block with plain children')
+                self._check_routed_ids(crule)
+                routed.append(crule)
+                continue
+
             cls = Factory_get(cname)
 
             # we can't construct it without __no_builder=True, because
@@ -1524,6 +1657,8 @@ class BuilderBase(object):
 
             if rule_children is not None:
                 rule_children.append(child)
+        if routed:
+            widget._kv_slots[''].fill = (routed, ids, [])
 
         # append the properties and handlers to our final resolution task
         if rule.properties:
@@ -1605,6 +1740,43 @@ class BuilderBase(object):
     # Control statements runtime support
     #
 
+    def _register_slot_block(self, widget, rule, rootrule, crule, ids,
+                             rule_children):
+        '''Process one ``slot`` block: the first block for a declared name is
+        the definition (a node is created at this position); later same-name
+        blocks are fills. An unknown name degrades to a new definition, with
+        a warning (it can never be filled).'''
+        slots = widget.__dict__.get('_kv_slots')
+        if slots is None:
+            slots = widget._kv_slots = {}
+        name = crule.slot_name
+        entry = slots.get(name)
+        if entry is None:
+            Logger.warning(
+                "Lang: filling unknown slot '%s': no class rule of <%s> "
+                'declares it; treating the block as a new slot definition'
+                % (name, type(widget).__name__))
+            entry = slots[name] = _SlotEntry()
+        elif not (entry.node is None and rule.slot_defs and
+                  name in rule.slot_defs):
+            # a fill: most derived provider wins (later rules overwrite)
+            entry.fill = (list(crule.children), ids, list(crule.locals))
+            return None, name == ''
+        node = SlotNode(self, widget, crule, ids)
+        node.owner_rule = rootrule
+        entry.node = node
+        self._pending.append(partial(node.activate, rule_children))
+        return node, False
+
+    def _check_routed_ids(self, crule):
+        if not isinstance(crule, ParserControlRule) and crule.id:
+            raise BuilderException(
+                crule.ctx, crule.line, '"id" is not allowed on children '
+                'routed into a slot; use an explicit "slot:" fill block '
+                'instead')
+        for child in crule.children:
+            self._check_routed_ids(child)
+
     def _assign_scope_id(self, ids, scope_id, widget):
         scope_key, name = scope_id
         scope = ids.get(scope_key)
@@ -1628,7 +1800,14 @@ class BuilderBase(object):
         cursor = pos
         for crule in crules:
             if isinstance(crule, ParserControlRule):
-                node = self._make_control_node(host, crule, ids, for_scope)
+                if crule.kind == 'slot':
+                    slots = host.__dict__.setdefault('_kv_slots', {})
+                    entry = slots.setdefault(crule.slot_name, _SlotEntry())
+                    node = SlotNode(self, host, crule, ids)
+                    entry.node = node
+                else:
+                    node = self._make_control_node(host, crule, ids,
+                                                   for_scope)
                 items.append(node)
                 node.activate(rule_children, cursor)
                 cursor += node.count()
@@ -1678,9 +1857,13 @@ class BuilderBase(object):
         rule created before, so they are not duplicated.'''
         nodes = widget.__dict__.get('_kv_control_nodes')
         entries = widget.__dict__.get('_kv_entries')
+        slots = widget.__dict__.get('_kv_slots')
         stale = []
         if nodes:
             stale += [n for n in nodes if n.owner_rule is rule]
+        if slots:
+            stale += [e.node for e in slots.values()
+                      if e.node is not None and e.node.owner_rule is rule]
         for node in stale:
             node.teardown()
             if nodes and node in nodes:

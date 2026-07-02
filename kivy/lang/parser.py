@@ -9,6 +9,7 @@ import os
 import io
 import re
 import sys
+import keyword
 import tokenize
 import traceback
 import ast
@@ -50,7 +51,7 @@ lang_key = re.compile('([a-zA-Z_]+)')
 lang_keyvalue = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]+)')
 lang_tr = re.compile(r'(_\()')
 lang_cls_split_pat = re.compile(', *')
-lang_control = re.compile(r'(if|elif|else|for|factory)\b')
+lang_control = re.compile(r'(if|elif|else|for|slot|factory)\b')
 
 # all the widget handlers, used to correctly unbind all the callbacks then the
 # widget is deleted
@@ -310,7 +311,8 @@ class ParserRule(object):
     __slots__ = ('ctx', 'line', 'name', 'children', 'id', 'properties',
                  'canvas_before', 'canvas_root', 'canvas_after',
                  'handlers', 'level', 'cache_marked', 'avoid_previous_rules',
-                 'has_controls', 'id_scope_key', 'id_scope_names', 'scope_id')
+                 'has_controls', 'id_scope_key', 'id_scope_names', 'scope_id',
+                 'slot_defs')
 
     def __init__(self, ctx, line, name, level):
         super(ParserRule, self).__init__()
@@ -348,6 +350,8 @@ class ParserRule(object):
         self.id_scope_names = []
         #: (scope_key, name) when this widget's id lives on a scope object
         self.scope_id = None
+        #: Slot names this rule declares (definitions), in document order
+        self.slot_defs = None
 
         if level == 0:
             self._detect_selectors()
@@ -467,14 +471,14 @@ class ParserControlBranch(ParserRule):
 
 
 class ParserControlRule(ParserRule):
-    '''A control statement (``if`` chain, ``for`` or ``factory``)
+    '''A control statement (``if`` chain, ``for``, ``slot`` or ``factory``)
     at child position in a rule. The body is parsed with the ordinary rule
     machinery; :class:`Parser` finalizes it (chain merging, scope resolution,
     reference rewriting) before precompilation.
     '''
 
     __slots__ = ('kind', 'branches', 'selector_prop', 'iterator_prop',
-                 'key_prop', 'class_prop', 'target_names',
+                 'key_prop', 'class_prop', 'target_names', 'slot_name',
                  'locals', 'scope_key', 'scope_names', 'in_canvas',
                  'header_src')
 
@@ -496,7 +500,9 @@ class ParserControlRule(ParserRule):
         self.class_prop = None
         #: for: loop target names, in order
         self.target_names = []
-        #: for: [(name, ParserRuleProperty)] iteration-locals, in order
+        #: slot: the slot name ('' for the default slot)
+        self.slot_name = ''
+        #: for/slot: [(name, ParserRuleProperty)] scoped locals, in order
         self.locals = []
         #: for: name of the per-iteration scope in expressions
         self.scope_key = None
@@ -959,6 +965,11 @@ class Parser(object):
             ctl.header_src = None
         elif kind == 'for':
             self._parse_for_header(ln, ctl, head)
+        elif kind == 'slot':
+            if expr and (not expr.isidentifier() or keyword.iskeyword(expr)):
+                raise ParserException(
+                    self, ln, 'invalid slot name %r' % expr)
+            ctl.slot_name = expr
         else:  # factory
             if not expr:
                 raise ParserException(
@@ -1103,6 +1114,9 @@ class Parser(object):
                 crule.scope_id = (rule.id_scope_key, name)
             env = {n: rule.id_scope_key for n in rule.id_scope_names}
         self._walk_rule(rule, env, None)
+        defs = []
+        self._collect_slot_defs(rule, defs)
+        rule.slot_defs = defs
 
     def _merge_control_chains(self, rule, in_canvas):
         self._merge_list(rule.children, in_canvas)
@@ -1202,6 +1216,8 @@ class Parser(object):
                 if child.kind == 'if':
                     for branch in child.branches:
                         self._collect_scoped_ids(branch, found)
+                elif child.kind == 'slot':
+                    self._collect_scoped_ids(child, found)
                 elif child.kind == 'factory':
                     self._forbid_ids(child)
                 # 'for': its ids live on the iteration scope
@@ -1216,6 +1232,8 @@ class Parser(object):
                 if child.kind == 'if':
                     for branch in child.branches:
                         self._collect_scoped_ids(branch, found)
+                elif child.kind == 'slot':
+                    self._collect_scoped_ids(child, found)
                 elif child.kind == 'factory':
                     self._forbid_ids(child)
             else:
@@ -1230,6 +1248,19 @@ class Parser(object):
                     self, child.line, '"id" is not allowed on widgets inside '
                     'a "factory" block')
             self._forbid_ids(child)
+
+    def _collect_slot_defs(self, rule, defs):
+        # slot names declared by this rule for its widget: direct blocks,
+        # inside `if` branches and nested in slot bodies (forwarding) -- but
+        # not across a child-widget boundary (those belong to the child)
+        for child in rule.children:
+            if isinstance(child, ParserControlRule):
+                if child.kind == 'slot':
+                    defs.append(child.slot_name)
+                    self._collect_slot_defs(child, defs)
+                elif child.kind == 'if':
+                    for branch in child.branches:
+                        self._collect_slot_defs(branch, defs)
 
     #
     # Control statements: validation, scopes and reference rewriting
@@ -1272,6 +1303,32 @@ class Parser(object):
                 self._walk_branch(branch, env, for_ctl)
         elif kind == 'for':
             self._walk_for(ctl, env)
+        elif kind == 'slot':
+            if for_ctl is not None:
+                raise ParserException(
+                    self, ctl.line, 'a slot cannot be defined inside a '
+                    '"for" block')
+            if ctl.handlers:
+                raise ParserException(
+                    self, ctl.handlers[0].line, 'event handlers are not '
+                    'allowed in a "slot" block')
+            if (ctl.canvas_root or ctl.canvas_before or ctl.canvas_after):
+                raise ParserException(
+                    self, ctl.line, 'canvas is not allowed in a "slot" '
+                    'block')
+            for name, prop in ctl.properties.items():
+                if name == 'key':
+                    raise ParserException(
+                        self, prop.line, '"key:" is only allowed inside a '
+                        '"for" block')
+                self._rewrite_prop(prop, env)
+                ctl.locals.append((name, prop))
+            ctl.properties = OrderedDict()
+            for child in ctl.children:
+                if isinstance(child, ParserControlRule):
+                    self._walk_control(child, env, None)
+                else:
+                    self._walk_rule(child, env, None)
         else:  # factory
             self._rewrite_prop(ctl.class_prop, env)
             if 'key' in ctl.properties:
@@ -1405,9 +1462,10 @@ class Parser(object):
 
     def _walk_canvas_control(self, ctl, env):
         kind = ctl.kind
-        if kind == 'factory':
+        if kind in ('slot', 'factory'):
             raise ParserException(
-                self, ctl.line, '"factory" cannot be declared inside canvas')
+                self, ctl.line, '"%s" cannot be declared inside canvas'
+                % kind)
         if kind == 'if':
             self._rewrite_prop(ctl.selector_prop, env)
             for branch in ctl.branches:

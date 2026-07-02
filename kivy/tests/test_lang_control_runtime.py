@@ -1,5 +1,5 @@
 '''
-Runtime tests for kv control statements (if/elif/else, for, factory).
+Runtime tests for kv control statements (if/elif/else, for, slot, factory).
 
 These cover the builder stage; pure parsing is tested in
 ``test_lang_parser_control.py``.
@@ -1232,6 +1232,300 @@ class ControlIdRuntimeTestCase(unittest.TestCase):
             Builder.unload_file('idgc.kv')
 
 
+class SlotRuntimeTestCase(unittest.TestCase):
+
+    def setUp(self):
+        Builder.load_string('''
+<SlotCard@BoxLayout>:
+    Label:
+        text: 'top'
+    slot header:
+        Label:
+            text: 'fallback-header'
+    slot:
+    Label:
+        text: 'bottom'
+''', filename='test_slot_runtime.kv')
+
+    def tearDown(self):
+        Builder.unload_file('test_slot_runtime.kv')
+
+    def test_fallback_when_instantiated_from_python(self):
+        from kivy.factory import Factory
+        card = Factory.SlotCard()
+        self.assertEqual(texts(card), ['top', 'fallback-header', 'bottom'])
+
+    def test_fallback_not_built_when_filled(self):
+        # the fallback build is deferred until the apply chain ends, so
+        # providing a fill means the fallback widgets are never created
+        # and never receive on_kv_post
+        from kivy.uix.label import Label
+        posts = []
+
+        class PostProbe(Label):
+            def on_kv_post(self, base_widget):
+                posts.append((self.text, self.parent is not None))
+
+        Builder.load_string('''
+<ProbeCard@BoxLayout>:
+    slot header:
+        PostProbe:
+            text: 'fallback'
+''', filename='test_slot_probe.kv')
+        try:
+            root = Builder.load_string('''
+BoxLayout:
+    ProbeCard:
+        slot header:
+            PostProbe:
+                text: 'fill'
+''')
+            self.assertEqual(texts(root.children[0]), ['fill'])
+            self.assertEqual(posts, [('fill', True)])
+        finally:
+            Builder.unload_file('test_slot_probe.kv')
+
+    def test_named_fill_and_routed_plain_children(self):
+        root = Builder.load_string('''
+BoxLayout:
+    title: 'Title'
+    SlotCard:
+        slot header:
+            Label:
+                text: root.title
+        Label:
+            text: 'body1'
+        Label:
+            text: 'body2'
+''')
+        card = root.children[0]
+        self.assertEqual(
+            texts(card), ['top', 'Title', 'body1', 'body2', 'bottom'])
+        root.title = 'New'
+        self.assertEqual(
+            texts(card), ['top', 'New', 'body1', 'body2', 'bottom'])
+
+    def test_explicit_default_fill_block(self):
+        root = Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        slot:
+            Label:
+                text: 'explicit-body'
+''')
+        self.assertEqual(
+            texts(root.children[0]),
+            ['top', 'fallback-header', 'explicit-body', 'bottom'])
+
+    def test_subclass_fill_overrides_base_and_instance_wins(self):
+        Builder.load_string('''
+<FancySlotCard@SlotCard>:
+    slot header:
+        Label:
+            text: 'fancy-header'
+''', filename='test_slot_runtime_sub.kv')
+        try:
+            from kivy.factory import Factory
+            fancy = Factory.FancySlotCard()
+            self.assertEqual(
+                texts(fancy), ['top', 'fancy-header', 'bottom'])
+            root = Builder.load_string('''
+BoxLayout:
+    FancySlotCard:
+        slot header:
+            Label:
+                text: 'instance-header'
+''')
+            self.assertEqual(
+                texts(root.children[0]),
+                ['top', 'instance-header', 'bottom'])
+        finally:
+            Builder.unload_file('test_slot_runtime_sub.kv')
+
+    def test_mixing_default_fill_block_and_plain_children_raises(self):
+        with self.assertRaises(BuilderException) as cm:
+            Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        slot:
+            Label:
+                text: 'in-block'
+        Label:
+            text: 'plain'
+''')
+        self.assertIn('cannot mix', str(cm.exception))
+
+    def test_id_on_routed_children_raises(self):
+        # implicitly routed plain children cannot carry an id (the parser
+        # cannot know they will be routed); an explicit ``slot:`` fill block
+        # is the supported spelling (see test below)
+        with self.assertRaises(BuilderException) as cm:
+            Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        Label:
+            id: nope
+            text: 'body'
+''')
+        self.assertIn('routed into a slot', str(cm.exception))
+
+    def test_id_in_explicit_fill_is_reactive_scoped(self):
+        # an id in an explicit slot fill block is a reactive id on the rule
+        # providing the fill, reachable by that rule's other expressions
+        root = Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        slot header:
+            TextInput:
+                id: head_input
+    Button:
+        disabled: head_input is None
+''')
+        btn = root.children[0]
+        self.assertFalse(btn.disabled)
+        self.assertNotIn('head_input', root.ids)
+
+    def test_slot_inside_if_branch(self):
+        Builder.load_string('''
+<IfSlotPanel@BoxLayout>:
+    show: True
+    if self.show:
+        Label:
+            text: 'pre'
+        slot extra:
+            Label:
+                text: 'extra-fallback'
+''', filename='test_slot_runtime_if.kv')
+        try:
+            root = Builder.load_string('''
+BoxLayout:
+    IfSlotPanel:
+        slot extra:
+            Label:
+                text: 'injected'
+''')
+            panel = root.children[0]
+            self.assertEqual(texts(panel), ['pre', 'injected'])
+            panel.show = False
+            self.assertEqual(texts(panel), [])
+            panel.show = True
+            self.assertEqual(texts(panel), ['pre', 'injected'])
+        finally:
+            Builder.unload_file('test_slot_runtime_if.kv')
+
+    def test_slot_forwarding_through_fill(self):
+        Builder.load_string('''
+<WrapCard@SlotCard>:
+    slot header:
+        Label:
+            text: 'wrap-pre'
+        slot title_extra:
+''', filename='test_slot_runtime_fwd.kv')
+        try:
+            from kivy.factory import Factory
+            wrap = Factory.WrapCard()
+            self.assertEqual(texts(wrap), ['top', 'wrap-pre', 'bottom'])
+            root = Builder.load_string('''
+BoxLayout:
+    WrapCard:
+        slot title_extra:
+            Label:
+                text: 'forwarded'
+''')
+            self.assertEqual(
+                texts(root.children[0]),
+                ['top', 'wrap-pre', 'forwarded', 'bottom'])
+        finally:
+            Builder.unload_file('test_slot_runtime_fwd.kv')
+
+    def test_unknown_slot_name_renders_as_definition_and_warns(self):
+        # filling a name the class never defined degrades to declaring a
+        # new insertion point; instance children are logically appended
+        # after the class rule's children, so it renders at the end. Since
+        # an instance-level definition can never be filled, this is almost
+        # always a typo, so a warning is logged.
+        with self.assertLogs('kivy', level='WARNING') as logs:
+            root = Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        slot typo_name:
+            Label:
+                text: 'oops'
+''')
+        card = root.children[0]
+        self.assertEqual(
+            texts(card), ['top', 'fallback-header', 'bottom', 'oops'])
+        self.assertTrue(any('typo_name' in m for m in logs.output))
+
+    def test_failed_apply_leaves_no_stale_rulectx(self):
+        # a BuilderException escaping mid-apply must not leave entries in
+        # Builder.rulectx; a stale entry breaks BuilderBase.create_from
+        # (used by the kivy_app test fixture) for every later caller
+        with self.assertRaises(BuilderException):
+            Builder.load_string('''
+BoxLayout:
+    SlotCard:
+        Label:
+            id: nope
+''')
+        self.assertEqual(dict(Builder.rulectx), {})
+
+    def test_widgets_without_slots_unaffected(self):
+        root = Builder.load_string('''
+BoxLayout:
+    Label:
+        text: 'plain'
+    BoxLayout:
+        Label:
+            text: 'nested'
+''')
+        self.assertEqual(root.children[1].text, 'plain')
+        self.assertEqual(texts(root.children[0]), ['nested'])
+
+
+class SlotScopeRuntimeTestCase(unittest.TestCase):
+    '''Slot-scoped locals: property lines in a slot definition are evaluated
+    in the defining rule's context and exposed to fallback and fill content
+    through the reserved ``slot`` name, so a shell class can hand values to
+    whatever content ends up in the hole (cascading slot props).'''
+
+    def setUp(self):
+        Builder.load_string('''
+<ScopedCard@BoxLayout>:
+    count: 3
+    slot header:
+        summary: 'items: ' + str(root.count)
+        Label:
+            text: slot.summary
+''', filename='scoped_card.kv')
+
+    def tearDown(self):
+        Builder.unload_file('scoped_card.kv')
+
+    def test_fallback_reads_slot_local(self):
+        from kivy.factory import Factory
+        card = Factory.ScopedCard()
+        self.assertEqual(texts(card), ['items: 3'])
+        card.count = 5
+        self.assertEqual(texts(card), ['items: 5'])
+
+    def test_fill_reads_slot_local_from_defining_context(self):
+        # the local is computed by the defining rule (root == the ScopedCard)
+        # even when the content comes from a fill written elsewhere
+        root = Builder.load_string('''
+BoxLayout:
+    ScopedCard:
+        count: 7
+        slot header:
+            Label:
+                text: '<' + slot.summary + '>'
+''')
+        card = root.children[0]
+        self.assertEqual(texts(card), ['<items: 7>'])
+        card.count = 9
+        self.assertEqual(texts(card), ['<items: 9>'])
+
+
 class ControlStatementGCTestCase(unittest.TestCase):
     '''A widget that uses control statements must stay garbage-collectable:
     the control nodes hold the children they build (whose ``.parent`` points
@@ -1277,6 +1571,16 @@ class ControlStatementGCTestCase(unittest.TestCase):
     for x in self.items:
         Label:
             text: str(x)
+''')
+        self.assertTrue(collected)
+
+    def test_slot_widget_is_collected(self):
+        collected, _ = self._collected('''
+<GcProbe@BoxLayout>:
+    flag: True
+    slot body:
+        Label:
+            text: 'fallback'
 ''')
         self.assertTrue(collected)
 

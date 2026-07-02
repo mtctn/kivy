@@ -1,5 +1,5 @@
 '''
-Tests for parsing kv control statements (if/elif/else, for, factory).
+Tests for parsing kv control statements (if/elif/else, for, slot, factory).
 
 These only cover the parser stage (:class:`kivy.lang.parser.Parser`);
 builder/runtime behavior is tested separately.
@@ -118,6 +118,20 @@ class ControlStatementParseTestCase(unittest.TestCase):
         Label:
 ''').children[0]
         self.assertEqual(ctl.target_names, ['first', 'rest'])
+
+    def test_slot_named_and_default(self):
+        rule = parse_rule('''
+<W@Widget>:
+    slot header:
+        Label:
+    slot:
+''')
+        named, default = rule.children
+        self.assertEqual(named.kind, 'slot')
+        self.assertEqual(named.slot_name, 'header')
+        self.assertEqual(len(named.children), 1)
+        self.assertEqual(default.slot_name, '')
+        self.assertEqual(default.children, [])
 
     def test_nested_controls(self):
         rule = parse_rule('''
@@ -369,6 +383,22 @@ if True:
             id: total
 ''', 'clashes')
 
+    def test_property_inside_slot_is_slot_local(self):
+        # a slot definition property is a slot-scoped local, evaluated in the
+        # defining rule's context and exposed to fallback and fill content as
+        # an attribute of the reserved ``slot`` name
+        rule = parse_rule('''
+<W@Widget>:
+    title: 'x'
+    slot header:
+        summary: self.title.upper()
+        Label:
+            text: slot.summary
+''')
+        ctl = rule.children[0]
+        self.assertEqual([n for n, _ in ctl.locals], ['summary'])
+        self.assertNotIn('summary', ctl.properties)
+
     def test_full_body_inside_if_allowed(self):
         # children + property + canvas + handler all live in one branch
         rule = parse_rule('''
@@ -434,6 +464,24 @@ if True:
         self.assertEqual(ctl.id_scope_names, ['lab'])
         self.assertEqual(ctl.children[0].scope_id, (ctl.scope_key, 'lab'))
         self.assertIn(ctl.scope_key, ctl.children[1].properties['text'].value)
+
+    def test_id_inside_slot_is_rule_scoped(self):
+        # an id on slot content (definition fallback or explicit fill block)
+        # is a reactive id on the rule providing that content
+        rule = parse_rule('''
+<W@Widget>:
+    slot header:
+        Label:
+            id: head
+    Button:
+        disabled: head is None
+''')
+        self.assertEqual(rule.id_scope_names, ['head'])
+        lbl = rule.children[0].children[0]
+        self.assertIsNone(lbl.id)
+        self.assertEqual(lbl.scope_id, (rule.id_scope_key, 'head'))
+        self.assertIn(rule.id_scope_key,
+                      rule.children[1].properties['disabled'].value)
 
     def test_id_inside_factory_body_forbidden(self):
         self.assert_parse_error('''
@@ -603,6 +651,14 @@ if True:
     async for x in self.items:
         Label:
 ''', '')
+
+    def test_invalid_slot_name(self):
+        for name in ('1bad', 'two words', 'if'):
+            self.assert_parse_error('''
+<W@Widget>:
+    slot %s:
+        Label:
+''' % name, 'invalid slot name')
 
     def test_factory_parses_class_expression_and_body(self):
         rule = parse_rule('''
